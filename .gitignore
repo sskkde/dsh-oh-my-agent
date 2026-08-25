@@ -1,0 +1,8 @@
+node_modules/
+lib/
+*.tsbuildinfo
+*.tgz
+# scratch: throwaway hook-test scripts + agent debug workspaces (not part of the package)
+/_*.mjs
+/.ag*-ws/
+

@@ -1,0 +1,7 @@
+# dsh-oh-my-agent bundle patch: inserts its dsh.client row into the web
+# plugin roster. The bundle is the official dsh plugin shape - inject it live
+# with dev_inject_plugin (dsh-super-injector), or add it with
+# `dsh plugin --profile web add /path/to/dsh-oh-my-agent`.
+- insert:
+    - id: dsh-oh-my-agent
+      name: '@dsh-external/dsh-oh-my-agent'
