@@ -71,57 +71,37 @@ until the task is done.
 
 const START_WORK: SkillRegistration = {
   name: 'omo-start-work',
-  description: 'Prometheus 访谈式规划 → 双评审 → Atlas 执行（复刻 OmO start-work）。含 RESUME 模式与 boulder 经验累积。',
-  whenToUse: '用户说 "start-work"、"/start-work"、或要求“先做个计划再动手”。',
+  description: '按已批准计划执行（复刻 OmO start-work）：选计划/恢复 → Atlas 编排执行到完成；无可执行计划时明确告知（先 /omo-ulw-plan 出计划并经批准），不访谈、不现场造计划。',
+  whenToUse: '用户说 "start-work"、"/start-work"、已批准计划后要求"把计划跑完/开始执行/继续计划"。',
   invocation: { modelInvocable: true, userInvocable: true },
   source: 'runtime',
-  content: `# start-work（Prometheus 访谈式规划 → 双评审 → Atlas 执行 · OmO start-work 移植）
+  content: `# start-work（OmO start-work 语义移植 · 按已批准计划执行）
 
-## RESUME 模式（先检查）
-If boulder has an ACTIVE plan watermark (\`omi_ultrawork\` created one, or a previous
-start-work session left \`activePlan\`), RESUME instead of starting fresh:
-- Read the plan + progress (completed/total) from boulder (\`omo_note\` list or status).
-- Re-inject a continuation prompt with the REMAINING tasks; continue as Atlas.
-- Do NOT re-interview when the plan is still on track.
-
-## INIT 模式 — Phase 1 访谈（Interview ↔ Research 循环）
-Act like a real engineer: ask concise clarifying questions. When needed, kick
-delegate_as(role=explore / role=librarian) to gather codebase context, then return to the
-interview with what you learned. Stop asking once genuinely-blocking unknowns are gone.
-
-## Phase 2 ClearanceCheck（每题后自检，5 项全过才继续）
-1. 核心目标清晰？ 2. 范围边界已定？ 3. 无关键歧义？ 4. 技术路线已决？
-5. 测试策略已确认？ 任一不满足 → 回到访谈继续问。
-
-## Phase 3 MetisConsult（强制缺口分析）
-用一次 delegate_as(role=metis, run_in_background=false) 独立抓取：隐性意图 / 歧义 / AI-slop / 验收标准缺口。
-把它的意见并入计划。
-
-## Phase 4 WritePlan
-写 \`.omo/plans/<name>.md\`（用 omo_ultrawork 落盘，或直接写文件），含：
-- Goal / Non-goals / Steps（每个文件与验证方式）/ Risks
-- 验收标准（可测、可验证）
-
-## Phase 5 HighAccuracy 双评审（高精度任务必走）
-并行 fire 两个独立 delegate_as review（role=momus 与 role=oracle，均 run_in_background=false）：
-- **Momus**（approval-biased）：计划清晰度、证据、可执行性；核文件存在、任务不矛盾、QA 场景具体。
-- **Oracle**（只读架构顾问）：独立审查。
-任一 REJECT → 修掉全部 cited 问题再重审（无上限重试，但少空转）；双 APPROVE → 通过。
-
-## Phase 6 Atlas 执行（orchestrator，绝不 implementer）
-循环：Read Plan → 分解任务 → **Accumulate Wisdom**（把 boulder learnings 前向注入每次委托）
-→ 并行委托独立 worker（delegate_as，per-category 选角色）→ Verify（跑诊断）→ 未完回委托 → 全 done 汇报。
-- 用 \`omo_team_task\` 维护共享任务表/领取语义。
-- 每任务后把 learnings/decisions/issues/verifications 沉淀到 \`omo_note\`。
-
-## Phase 7 验证 & 收尾
-- 跑验证清单，修到全绿。
-- \`omo_comment_check\`；\`omo_handoff\` 交接；汇报交付证据。
+本技能只做一件事：把**已批准的计划**跑完。**不访谈、不写计划、不评审计划**——规划属于 ulw-plan，执行属于本技能。
 
 ## 会话模型（Atlas 执行态）
-进入本技能=用户已批准计划、进入执行：插件自动切换为 **Atlas 执行态**——会话模型切到 Atlas 角色路由
-（delegate_roles.atlas > categories.ultrabrain > heavy 档），系统提示注入 Atlas 执行纪律段（omo:atlas-execution），写门打开。
-若未自动生效，调用 \`omo_session_model(state=atlas)\` 手动开启；结束后 \`omo_session_model(state=off)\` 还原默认。`,
+进入本技能时，插件**仅当存在可执行计划**（\`.omo/plans/\` 下有计划文件，或 boulder 有 activePlan）才自动切换为 Atlas 执行态：
+模型切 Atlas 角色路由（delegate_roles.atlas > categories.ultrabrain > heavy 档）、注入执行纪律段（omo:atlas-execution）、写门打开。
+若未自动生效，可 \`omo_session_model(state=atlas)\` 手动开启；结束后 \`omo_session_model(state=off)\` 还原默认。
+
+## 无可执行计划 → 明确告知（不做任何 bootstrap）
+读 \`.omo/plans/\` 与 \`.omo/boulder.json\`：
+- 无任何计划文件且无 activePlan → **明确告知用户**："当前没有可执行的已批准计划。请先运行 /omo-ulw-plan 产出计划并经批准，再 /omo-start-work 执行。"
+  然后**停止**——不自行进入执行、不访谈、不现场造计划、不派任何实现子代理。
+
+## 选计划（有可执行计划时）
+- boulder 有 activePlan 且未完成 → 恢复它：读计划全文与进度（completed/total），从第一个未勾 \`- [ ]\` 的 checkbox 继续，不重头来。
+- 无 activePlan 但 \`.omo/plans/\` 恰有一个计划文件 → 自动选择。
+- 多个计划或多个 active work → 用 \`ask_user_question\` 一次问清选哪个（展示计划名/进度/时间戳）。
+
+## 执行（Atlas 编排，绝不 implementer）
+- 你是编排者不是实现者：代码 / 测试 / QA 全部经 delegate_as 派发；自己只碰计划选择、\`.omo/\` 状态（boulder、checkbox、ledger）、分解、派发、验收、证据记录。
+- 每次委托带 6 段简报（TASK / EXPECTED OUTCOME / REQUIRED TOOLS / MUST DO / MUST NOT DO / CONTEXT）+ STOP WHEN / EVIDENCE 验收项。
+- 并行默认：独立任务一条消息全发，只排命名依赖。
+- 每波验收：读回变更文件 + 跑验证命令 + 重读计划；全绿才把 checkbox 勾 \`- [x]\` 再推进。
+- 失败续跑：send_message 回同一子代理补交付物；同一波连续 3 次失败：停止、回退、记录、换代。
+- 收尾 Final Wave：验证清单全绿 + 评审（delegate_as role=momus）APPROVE 才报完成；交付报告含变更清单与 Final Wave 结论。
+- 每任务后把 learnings/decisions/issues/verifications 沉淀到 \`omo_note\`；收尾 \`omo_comment_check\` + \`omo_handoff\`。`,
 }
 
 const RULES: SkillRegistration = {

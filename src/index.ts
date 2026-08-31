@@ -30,6 +30,7 @@ import z from 'schemastery'
 
 import path from 'node:path'
 import { readFile } from 'node:fs/promises'
+import { existsSync, readdirSync } from 'node:fs'
 import { text, PLUGIN_ID, ensureDir, resolveWorkspace, nowTs, omoDir, stripUndefined } from './util.js'
 import { scanRules, refreshRulesState } from './rules.js'
 import { boulderSummary, listNotes, appendNote, updateNote, newThreadBoulder, checkpointBoulder, isSection, SECTIONS, loadBoulder } from './boulder.js'
@@ -102,6 +103,19 @@ interface SysPromptCtx {
 let lastWs = ''
 /** Host ctx (set in apply) — delegate_as reads the subagents service lazily. */
 let hostCtx: unknown = null
+
+/** 是否存在可执行计划：.omo/plans/ 下有计划文件，或 boulder 有 activePlan（start-work 切 Atlas 的前置条件）。 */
+export function hasExecutablePlan(ws: string): boolean {
+  try {
+    const b = loadBoulder(ws) as unknown as AnyObj
+    if (b.activePlan) return true
+  } catch { /* ignore */ }
+  try {
+    const dir = omoDir(ws, 'plans')
+    if (existsSync(dir)) return readdirSync(dir).some((f) => f.endsWith('.md'))
+  } catch { /* ignore */ }
+  return false
+}
 
 /** 会话默认模型 selection（agent-default-model 服务；不可用时 undefined）。 */
 function defaultsSelection(): ModelConfig | undefined {
@@ -1856,6 +1870,11 @@ export function apply(ctx: Context, config: Config): void {
         const merged = loadLayeredConfig(ws).merged
         const routes: DelegateRoutes = { provider: config.delegateProvider, flash: config.delegateFlashRoute, heavy: config.delegateHeavyRoute }
         const mode: SessionMode = intent.mode
+        // start-work 对齐原版：无可执行计划时不切 Atlas 执行态，由技能明确告知用户
+        if (mode === 'atlas' && !hasExecutablePlan(ws)) {
+          ctx.logger?.info?.('[dsh-oh-my-agent] start-work 注入但无可执行计划——不切换 Atlas 执行态（技能将明确告知）')
+          return decision
+        }
         const route = mode === 'atlas' ? roleModelRoute('atlas', merged, routes) : mode === 'prometheus' ? prometheusPlanRoute(merged, routes) : undefined
         const r = await setSessionMode(agent, mode, route, defaultsSelection())
         const modeLabel = mode === 'atlas' ? 'atlas 执行态' : mode === 'prometheus' ? 'prometheus 规划态' : 'off（还原默认）'
