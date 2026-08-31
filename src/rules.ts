@@ -111,6 +111,10 @@ export function loadRule(ws: string, file: string): RuleFile | null {
     return null
   }
   const { meta, body } = parseFrontmatter(raw)
+  // Empty rule bodies (stale artifacts, empty placeholders) carry no
+  // actionable content — never treat them as rules, or the rules-injector
+  // would fire with an empty shell.
+  if (!body.trim()) return null
   const rel = posix(path.relative(ws, file))
   const name = (meta.description as string) || ruleNameFromFile(rel, body)
   const globs = Array.isArray(meta.globs)
@@ -152,6 +156,9 @@ export function scanRules(ws: string): RuleFile[] {
   if (fs.existsSync(userRulesDir)) {
     for (const f of walkFiles(userRulesDir, 6)) {
       if (f.endsWith('.mdc') || f.endsWith('.md')) {
+        // Skip the engine's own persisted artifacts (compiled.md from an
+        // earlier user-level compile) — they are outputs, not rule sources.
+        if (path.basename(f) === 'compiled.md') continue
         const r = loadRule(ws, f)
         if (r) rules.push(r)
       }
