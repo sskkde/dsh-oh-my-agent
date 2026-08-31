@@ -62,7 +62,11 @@ until the task is done.
 - Produce \`omo_handoff\` so a fresh session can continue.
 - **Never compromise**: hit a blocker → consult, ask the user, or change approach —
   return only when the goal is actually done.
-- Report done to the user.`,
+- Report done to the user.
+
+## 会话模型（规划态还原）
+本技能启动=进入自主执行：插件的规划态自动关闭（会话模型还原、写入门打开）。
+若未自动生效，调用 \`omo_session_model(state=off)\` 手动还原。`,
 }
 
 const START_WORK: SkillRegistration = {
@@ -113,6 +117,10 @@ interview with what you learned. Stop asking once genuinely-blocking unknowns ar
 ## Phase 7 验证 & 收尾
 - 跑验证清单，修到全绿。
 - \`omo_comment_check\`；\`omo_handoff\` 交接；汇报交付证据。
+
+## 会话模型（规划态还原）
+进入本技能=用户已批准计划、进入执行：插件的规划态自动关闭——当前会话模型还原到切换前（或会话默认），写入门打开。
+若未自动生效，调用 \`omo_session_model(state=off)\` 手动还原。`,
 }
 
 const RULES: SkillRegistration = {
@@ -476,6 +484,11 @@ const ULW_PLAN: SkillRegistration = {
 
 ### 4. 等待批准
 展示计划 -> **停**。用户批准后才进入执行（start-work / ultrawork）。不批准不执行，不"先做一点点"。
+
+## 会话模型（规划态）
+进入本技能时插件的规划态自动开启：当前会话模型切到 Prometheus 角色路由（delegate_roles.prometheus > categories.deep > heavy 档），
+写入门同时关闭（write/edit/hashline 只允许 plan_write_scopes 内 *.md）。若未自动生效，调用 \`omo_session_model(state=on)\` 手动开启。
+批准执行（进入 start-work / ultrawork）时规划态自动还原；也可用 \`omo_session_model(state=off)\` 手动还原。全程只写 .omo/ 下计划工件。
 
 ## 判据
 好计划 = 执行者拿到后**一个问题都不用问**。做不到就回炉继续探索/追问。`,

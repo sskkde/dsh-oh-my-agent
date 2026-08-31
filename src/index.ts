@@ -1,15 +1,20 @@
 /**
  * dsh-oh-my-agent — 忠实复刻 oh-my-openagent (OmO) 核心能力的 DSH 插件。
  *
- * Host half: registers 21 agent tools (status, rules engine, boulder notepad,
+ * Host half: registers 22 agent tools (status, rules engine, boulder notepad,
  * memory, hashline editor, structured code search, comment checker, background
  * monitors, ultrawork conductor, handoff, team task table, layered config,
- * codegraph, lsp, model routing, hooks introspection, agent roster/briefs,
- * context7 docs, look-at orchestrator, dynamic SKILL.md loader), 16 runtime
- * skills (ultrawork / start-work / ulw-plan / rules / handoff / memory /
- * model-routing / subagent-roles / deliver / hyperplan / refactor /
- * remove-ai-slops / debugging / review-work / init-deep / git-master), and a
- * JSON API for the client panel (/dsh-oh-my-agent/api/*).
+ * codegraph, lsp, model routing, planning-mode session switch, hooks
+ * introspection, agent roster/briefs, context7 docs, look-at orchestrator,
+ * dynamic SKILL.md loader), 16 runtime skills (ultrawork / start-work / ulw-plan
+ * / rules / handoff / memory / model-routing / subagent-roles / deliver /
+ * hyperplan / refactor / remove-ai-slops / debugging / review-work / init-deep
+ * / git-master), and a JSON API for the client panel (/dsh-oh-my-agent/api/*).
+ *
+ * Planning mode (Plugin source, Prometheus): invoking the omo-ulw-plan skill
+ * switches this session's model to the prometheus role route (omoconfig-driven)
+ * and closes the write gate to plan artifacts; start-work/ultrawork invocation
+ * reverts both. Manual fallback tool: omo_session_model.
  *
  * Everything an agent-facing tool persists lands under `<workspace>/.omo/`
  * (the same state-dir convention OmO uses).
@@ -38,6 +43,7 @@ import { docsSearch, docsGet } from './docs.js'
 import { lookAt, LOOK_INTENTS } from './lookAt.js'
 import { registerSkills, listRegistered } from './dynamicSkills.js'
 import { omoPreExecute, omoPostExecute, hooksStatus, type HooksConfig } from './hooks.js'
+import { prometheusPlanRoute, planningIntentOf, setPlanning, type ModelConfig } from './sessionModel.js'
 import * as mem from './memory.js'
 import { MonitorRegistry } from './monitor.js'
 import { createUltraPlan, updateUltraPhase, ultraworkPhaseText, readUltraPlan, recordWaveProgress, type UltraPhase, type Wave } from './ultrawork.js'
@@ -92,6 +98,18 @@ interface SysPromptCtx {
 let lastWs = ''
 /** Host ctx (set in apply) — delegate_as reads the subagents service lazily. */
 let hostCtx: unknown = null
+
+/** 会话默认模型 selection（agent-default-model 服务；不可用时 undefined）。 */
+function defaultsSelection(): ModelConfig | undefined {
+  try {
+    const svc = (hostCtx as { get?: (name: string) => unknown } | null)?.get?.('agentDefaultModel') as { currentSelection?: () => ModelConfig } | undefined
+    const sel = svc?.currentSelection?.()
+    if (sel && typeof sel.provider === 'string' && sel.provider && typeof sel.model === 'string' && sel.model) {
+      return { provider: sel.provider, model: sel.model, ...(typeof sel.reasoningEffort === 'string' && sel.reasoningEffort ? { reasoningEffort: sel.reasoningEffort } : {}) }
+    }
+  } catch { /* ignore */ }
+  return undefined
+}
 /** Tool names actually registered this run (filtered by omo.jsonc toggles). */
 let registeredToolNames: string[] = []
 /** ctx.skills.register bound at apply() (dynamic SKILL.md loader). */
@@ -1096,7 +1114,7 @@ function buildTools(config: Config): ToolDefinition[] {
   tools.push(
     tool(
       'omo_hooks',
-      '自动 hook 拦截层（复刻 oh-my-openagent Pre/PostToolUse 闸门，挂 DSH tools/pre-execute + post-execute）：write-existing-file-guard（覆盖已存在文件守卫）、comment-checker（写后自动扫阻断标记）、rules-injector（编辑时自动注入该路径的已编译规则）、read-only-gate（只读规划 agent 只许写 .omo/ 下的 md）、edit-error-recovery（编辑失败注入"停止-重读-验证"恢复指引，连续 2 次失败升级为换方法）、json-error-recovery（参数 JSON/schema 校验失败注入修正指引）、monitor-status-injector（运行中后台 monitor 状态变化时注入一行状态）、hashline-read-enhancer（首次 read 后提示行锚编辑可用）。开关经 omo.jsonc [opencode].hooks 与 disabled_hooks；status 显示生效配置与最近事件，log 看事件流。',
+      '自动 hook 拦截层（复刻 oh-my-openagent Pre/PostToolUse 闸门，挂 DSH tools/pre-execute + post-execute）：write-existing-file-guard（覆盖已存在文件守卫）、comment-checker（写后自动扫阻断标记）、rules-injector（编辑时自动注入该路径的已编译规则）、read-only-gate（read_only_agents 名单只许写 .omo/ 下 md；Prometheus 规划态动态门，默认另放行 .agent-notes/，可经 plan_write_scopes 配置）、edit-error-recovery（编辑失败注入"停止-重读-验证"恢复指引，连续 2 次失败升级为换方法）、json-error-recovery（参数 JSON/schema 校验失败注入修正指引）、monitor-status-injector（运行中后台 monitor 状态变化时注入一行状态）、hashline-read-enhancer（首次 read 后提示行锚编辑可用）。开关经 omo.jsonc [opencode].hooks 与 disabled_hooks；status 显示生效配置与最近事件，log 看事件流。',
       {
         action: { type: 'string', enum: ['status', 'log'], required: true, default: 'status' },
         tail: { type: 'integer', description: 'log 返回条数' },
@@ -1208,6 +1226,42 @@ function buildTools(config: Config): ToolDefinition[] {
           reasoning: args.reasoning ? String(args.reasoning) : undefined,
         })
         return { ok: dec.ok, category: dec.category ?? '', source: dec.source, note: dec.note, chosen: dec.chosen, chain: dec.chain, catalog: dec.catalog }
+      },
+    ),
+  )
+
+  // ─────────────────────── omo_session_model (规划态会话模型) ─────────
+  tools.push(
+    tool(
+      'omo_session_model',
+      'Prometheus 规划态会话模型开关。state=on：把当前会话模型切到 Prometheus 角色路由（delegate_roles.prometheus > categories.deep > heavy 档），并开启规划写入门（write/edit/hashline 仅能写 plan_write_scopes 内 *.md）；state=off：还原切换前模型（或会话默认），并开门。规划态通常由 /omo-ulw-plan 自动开启、start-work/ultrawork 自动关闭；本工具用于手动兜底与状态确认。生效时序与官方 selectModel 同语义：从切换后的下一次请求生效。',
+      {
+        state: { type: 'string', enum: ['on', 'off'], required: true, description: 'on=进入规划态（切模型+关写门）；off=还原（模型还原+开写门）' },
+      },
+      {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          ok: { type: 'boolean' },
+          active: { type: 'boolean' },
+          route: { type: 'string' },
+          source: { type: 'string' },
+          reason: { type: 'string' },
+        },
+      },
+      (_a, v) => text(v.ok ? `规划态: ${String(v.active ? 'ON（规划模型）' : 'OFF（已还原）')}  route=${String(v.route || '')}${v.source ? `（${v.source}）` : ''}` : `切换失败: ${String(v.reason || '')}`),
+      async (args, exec) => {
+        const state = String(args.state || 'off')
+        const ws = wsFromExec(config, exec)
+        const merged = loadLayeredConfig(ws).merged
+        const routes: DelegateRoutes = { provider: config.delegateProvider, flash: config.delegateFlashRoute, heavy: config.delegateHeavyRoute }
+        const planRoute = prometheusPlanRoute(merged, routes)
+        const r = await setPlanning(exec.agent, state === 'on', planRoute, defaultsSelection())
+        const out: AnyObj = { ok: r.ok, active: r.active ?? false }
+        if (r.route) out.route = `${r.route.provider}/${r.route.model}`
+        if (r.source) out.source = r.source
+        if (r.reason) out.reason = r.reason
+        return out
       },
     ),
   )
@@ -1776,6 +1830,39 @@ export function apply(ctx: Context, config: Config): void {
       try { if (typeof b === 'function') b() } catch { /* ignore */ }
     }
   }, 'dsh-oh-my-agent: hooks listeners')
+
+  // Prometheus 规划态：会话模型自动切换（skill 注入/调用路径 → pre-step 检测）
+  ctx.effect(() => {
+    const anyCtx = ctx as unknown as { on: (ev: string, fn: unknown) => (() => void) | undefined }
+    const c = anyCtx.on('agent/pre-step', async (payload: unknown, next: unknown) => {
+      // 先让下游（含 dsh-tool-skill 的注入）完成，再读最终 decision
+      const decision = await (next as () => Promise<AnyObj>)()
+      try {
+        const agent = (payload as AnyObj | undefined)?.agent
+        if (!agent) return decision
+        const intent = planningIntentOf(decision as AnyObj)
+        if (!intent) return decision
+        const cwd = ((agent as { session?: { header?: { cwd?: string } } }).session)?.header?.cwd
+        const ws = wsForConfig(config, cwd)
+        const merged = loadLayeredConfig(ws).merged
+        const routes: DelegateRoutes = { provider: config.delegateProvider, flash: config.delegateFlashRoute, heavy: config.delegateHeavyRoute }
+        const planRoute = prometheusPlanRoute(merged, routes)
+        const r = await setPlanning(agent, intent === 'on', planRoute, defaultsSelection())
+        if (!r.ok) {
+          ctx.logger?.warn?.(`[dsh-oh-my-agent] planning mode ${intent} failed: ${String(r.reason ?? '')}`)
+        } else {
+          ctx.logger?.info?.(`[dsh-oh-my-agent] planning mode ${intent === 'on' ? 'ON' : 'OFF'}（route=${r.route?.provider}/${r.route?.model}${r.source ? `, source=${r.source}` : ''}）`)
+        }
+      } catch (e) {
+        // 规划态切换绝不破坏步骤本身
+        ctx.logger?.warn?.(`[dsh-oh-my-agent] planning pre-step switch error: ${String(e)}`)
+      }
+      return decision
+    })
+    return () => {
+      try { if (typeof c === 'function') c() } catch { /* ignore */ }
+    }
+  }, 'dsh-oh-my-agent: planning-mode session switch')
 
   // main-session system-prompt section (dsh-system-prompt channel).
   // Registered on the plugin's own long-lived fiber so the section persists;
