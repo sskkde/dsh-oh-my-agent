@@ -52,6 +52,7 @@ import { createUltraPlan, updateUltraPhase, ultraworkPhaseText, readUltraPlan, r
 import { buildHandoff } from './handoff.js'
 import { skillRegistrations } from './skills.js'
 import { SISYPHUS_SECTION } from './sisyphusPrompt.js'
+import { PROMETHEUS_SECTION } from './prometheusPrompt.js'
 import { loadTasks, saveTasks, type TaskRow } from './teamTask.js'
 import { loadLayeredConfig, mergedTools, mergedToggle, loadUserConfig } from './omoconfig.js'
 
@@ -1890,15 +1891,35 @@ export function apply(ctx: Context, config: Config): void {
       : config.mainPrompt === 'custom' ? config.customPromptSection : ''
     if (body.trim()) {
       try {
+        // B 方案：orchestration 纪律段按会话模式唯一化——off 才注入 Sisyphus；
+        // prometheus 规划态注入 Prometheus 纪律段、atlas 执行态注入 Atlas 段，
+        // 三个模式互斥（一份编排纪律只对应一个身份，避免实现权冲突）。
+        const text = config.mainPrompt === 'custom'
+          ? body
+          : (context: { agent?: unknown }) => (context?.agent === undefined ? body : (sessionModeOf(context.agent) === 'off' ? body : ''))
         regOnce(ctx, () => spCtx.systemPrompt!.section({
           name: 'omo:sisyphus-discipline',
           order: 50,
-          text: body,
+          text,
         }), 'dsh-oh-my-agent: system prompt section')
-        ctx.logger?.info?.(`[dsh-oh-my-agent] main-prompt section registered (mode=${config.mainPrompt}, name=omo:sisyphus-discipline, order=50, ${body.length} chars)`)
+        ctx.logger?.info?.(`[dsh-oh-my-agent] main-prompt section registered (mode=${config.mainPrompt}, name=omo:sisyphus-discipline, order=50, dynamic-by-session-mode)`)
       } catch (e) {
         ctx.logger?.warn?.(`[dsh-oh-my-agent] main-prompt section registration failed: ${String(e)}`)
       }
+    }
+  }
+
+  // Prometheus 规划态动态段：仅在 prometheus 模式组装（与 sisyphus 段互斥）
+  if (typeof spCtx.systemPrompt?.section === 'function') {
+    try {
+      regOnce(ctx, () => spCtx.systemPrompt!.section({
+        name: 'omo:prometheus-planning',
+        order: 50,
+        text: (context) => (context?.agent !== undefined && sessionModeOf(context.agent) === 'prometheus') ? PROMETHEUS_SECTION : '',
+      }), 'dsh-oh-my-agent: prometheus-planning section')
+      ctx.logger?.info?.('[dsh-oh-my-agent] prometheus-planning section registered (name=omo:prometheus-planning, order=50, dynamic)')
+    } catch (e) {
+      ctx.logger?.warn?.(`[dsh-oh-my-agent] prometheus-planning section registration failed: ${String(e)}`)
     }
   }
 
