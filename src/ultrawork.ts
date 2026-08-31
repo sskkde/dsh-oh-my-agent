@@ -5,8 +5,8 @@
  * orchestrator's prompt: classify intent → build a plan → delegate in parallel
  * waves by CATEGORY (not by model name) → verify with diagnostics → deliver.
  *
- * DSH mapping: the calling agent does the real subagent delegation with its
- * native subagent tools (subagent_default/deep/plugin...). This module provides
+ * DSH mapping: the calling agent does the real delegation through the
+ * delegate_as tool (role per category). This module provides
  * the conductor: a durable plan store (`.omo/work/<ts>/plan.md` + plan.json),
  * the phase state machine, the category→tool mapping table, and the playbook
  * text the agent should follow. `omo_ultrawork` advances/reads that state.
@@ -40,15 +40,15 @@ export interface UltraPlan {
   dir: string
 }
 
-/** Map OmO category → the DSH subagent tool / flavor to delegate with. */
+/** Map OmO category → the delegate_as role / flavor to delegate with. */
 export const CATEGORY_TO_DSH: Record<string, string> = {
-  ultrabrain: 'subagent_oracle (or subagent_deep) — hardest reasoning',
-  deep: 'subagent_deep — deep reasoning',
-  quick: 'subagent_default — fast, bounded',
-  visual: 'subagent_default with describe_image — visual/engineering review',
-  writing: 'subagent_default — prose/docs',
-  'unspecified-high': 'subagent_deep',
-  'unspecified-low': 'subagent_default',
+  ultrabrain: 'delegate_as role=oracle (or role=hephaestus) — hardest reasoning',
+  deep: 'delegate_as role=hephaestus — deep reasoning',
+  quick: 'delegate_as role=sisyphus-junior — fast, bounded',
+  visual: 'omo_look_at + describe_image — visual/engineering review',
+  writing: 'delegate_as role=sisyphus-junior — prose/docs',
+  'unspecified-high': 'delegate_as role=hephaestus',
+  'unspecified-low': 'delegate_as role=sisyphus-junior',
 }
 
 export function readUltraPlan(ws: string): UltraPlan | null {
@@ -180,12 +180,12 @@ export function ultraworkPhaseText(ws: string): { phase: UltraPhase; markdown: s
       '',
       `**Goal:** ${plan.goal}`,
       '',
-      'Delegate each wave with a native subagent tool per its category:',
+      'Delegate each wave via delegate_as per its category:',
       ...plan.waves.map((w, i) => `- Wave ${i + 1} **${w.name}** (${w.category}) → use ${CATEGORY_TO_DSH[w.category] ?? w.category}.${w.model ? ' Brain: ' + w.model.provider + '/' + w.model.model + ' (' + w.model.reasoning + ').' : ''} Task: ${w.goal}${w.files.length ? ` Files: ${w.files.join(', ')}` : ''}.`),
       '',
       '- Independent waves: run them **in parallel** (fire all subagent calls in one message).',
       '- Dependent waves (dependsOn): run only after their dependencies report back.',
-      '- Each subagent brief must include STOP WHEN / EVIDENCE / MUST NOT DO (delegation protocol).',
+      '- Each brief must include TASK / EXPECTED OUTCOME / STOP WHEN / EVIDENCE / MUST NOT DO / CONTEXT (delegation protocol).',
       '- Collect results, fix integration issues, then advance to `verify`.',
     ],
     verify: [

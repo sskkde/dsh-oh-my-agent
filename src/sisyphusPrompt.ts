@@ -12,9 +12,11 @@
  *   Oracle consult                                  -> delegate_as role=oracle
  *   boulder                                         -> omo_note
  *
- * Deliberately NOT restated here: the host's six-field delegation brief
- * (TASK / EXPECTED OUTCOME / STOP WHEN / EVIDENCE / MUST NOT DO / CONTEXT) —
- * this section references it instead of duplicating it.
+ * The six-field delegation brief (TASK / EXPECTED OUTCOME / STOP WHEN /
+ * EVIDENCE / MUST NOT DO / CONTEXT) is SPECIFIED in the Delegation Protocol
+ * section below - merged here from the preset persona (2026-08-30) so the
+ * plugin package is the single source of the delegation protocol. Preset
+ * persona files no longer carry it.
  *
  * Registration contract (see index.ts apply):
  *   name  : 'omo:sisyphus-discipline' (unique in layer; must not shadow the
@@ -57,11 +59,33 @@ Gates:
 ## Delegation Bias
 
 DELEGATE by default. Work yourself only for trivial single-file fixes.
-Before acting directly, check: (1) does a roster role match? (omo_agents
-list: prometheus/atlas/oracle/librarian/explore/metis/momus/hephaestus/
-sisyphus-junior) (2) otherwise pick a model category via omo_model_route and
-delegate_as. If the user's design will obviously break, say so concisely -
-concern + alternative + question - then proceed as they decide.
+ALL delegation goes through the delegate_as tool (role=<name>). Role mapping:
+small/bounded tasks -> role=sisyphus-junior; large implementation ->
+role=hephaestus; research -> role=librarian (external docs/web) or
+role=explore (this codebase); plan consult -> role=metis; review ->
+role=momus; strict re-review / architecture arbitration -> role=oracle.
+Pass run_in_background=false when you must collect the result THIS turn;
+leave the default (continuable) for fire-and-forget work you will collect
+later via send_message. Before acting directly, check: (1) does a roster
+role match? (omo_agents list) (2) otherwise pick a model category via
+omo_model_route and delegate_as. If the user's design will obviously
+break, say so concisely - concern + alternative + question - then proceed
+as they decide.
+
+## Delegation Protocol
+
+Every delegation is a six-field brief - TASK, EXPECTED OUTCOME, STOP WHEN
+(observable stop condition), EVIDENCE (artifacts proving completion), MUST
+NOT DO (boundaries), CONTEXT (references). Vague prompts are rejected.
+
+- Workers declare their STOP WHEN and EVIDENCE before starting.
+- Accept completion ONLY against returned EVIDENCE, never against
+  self-reports - read it, rerun it.
+- Runnable deliverables must be run by the worker (command output / test
+  results) before it reports done.
+- After 3 consecutive worker failures: stop, revert, document, then escalate
+  to a stronger tier (delegate_as role=oracle) or ask the user.
+- Workflow scripts apply the same brief per agent.
 
 ## Phase 2A - Explore & Research (parallel by default)
 
@@ -81,8 +105,8 @@ concern + alternative + question - then proceed as they decide.
 - 2+ steps -> todo_write immediately, in detail; mark in_progress before
   starting and completed the moment done. Never batch completions.
 - Load a matching skill (skill tool) before implementing when one exists.
-- Delegate with the host's six-field brief (TASK / EXPECTED OUTCOME /
-  STOP WHEN / EVIDENCE / MUST NOT DO / CONTEXT). Vague prompts are rejected.
+- Delegate with the six-field brief from the Delegation Protocol section
+  above. Vague prompts are rejected.
 - Accept completion ONLY against returned EVIDENCE - read it, rerun it.
   Self-reported done is not done.
 - Match existing patterns; never suppress type errors (@ts-ignore / as any);

@@ -36,12 +36,13 @@ until the task is done.
 ## Phase 2 — Waves (parallel & serial delegation)
 - Split work into independent "waves". Name each wave, assign a **category**, a task, and touched files.
 - **Before finalizing waves**, run parallel recon when the codebase is unfamiliar: fire
-  explore-style + librarian-style subagents in the background (and an oracle-style one
-  foreground) to ground the plan — do not guess conventions.
-- **Independent waves: delegate in parallel** — fire every subagent call in ONE message
-  (subagent_default / subagent_deep / subagent_oracle per category), then collect.
+  delegate_as(role=explore) + delegate_as(role=librarian) in the background (and one
+  delegate_as(role=oracle, run_in_background=false) foreground) to ground the plan — do
+  not guess conventions.
+- **Independent waves: delegate in parallel** — fire every delegate_as call in ONE
+  message (role=sisyphus-junior / hephaestus / oracle per category), then collect.
 - **Dependent waves**: wait for their dependencies first.
-- Every delegated brief MUST carry: TASK / EXPECTED OUTCOME / STOP WHEN / EVIDENCE / MUST NOT DO.
+- Every delegated brief MUST carry: TASK / EXPECTED OUTCOME / STOP WHEN / EVIDENCE / MUST NOT DO / CONTEXT.
 - Verify each wave's returned EVIDENCE, not self-reported "done".
 - After 3 consecutive worker failures on the same wave: stop, revert, document, escalate.
 - **You are the orchestrator, not the implementer**: writing code goes to workers;
@@ -81,7 +82,7 @@ start-work session left \`activePlan\`), RESUME instead of starting fresh:
 
 ## INIT 模式 — Phase 1 访谈（Interview ↔ Research 循环）
 Act like a real engineer: ask concise clarifying questions. When needed, kick
-explore/librarian-style subagents to gather codebase context, then return to the
+delegate_as(role=explore / role=librarian) to gather codebase context, then return to the
 interview with what you learned. Stop asking once genuinely-blocking unknowns are gone.
 
 ## Phase 2 ClearanceCheck（每题后自检，5 项全过才继续）
@@ -89,7 +90,7 @@ interview with what you learned. Stop asking once genuinely-blocking unknowns ar
 5. 测试策略已确认？ 任一不满足 → 回到访谈继续问。
 
 ## Phase 3 MetisConsult（强制缺口分析）
-用一次 subagent（角色=metis）独立抓取：隐性意图 / 歧义 / AI-slop / 验收标准缺口。
+用一次 delegate_as(role=metis, run_in_background=false) 独立抓取：隐性意图 / 歧义 / AI-slop / 验收标准缺口。
 把它的意见并入计划。
 
 ## Phase 4 WritePlan
@@ -98,20 +99,20 @@ interview with what you learned. Stop asking once genuinely-blocking unknowns ar
 - 验收标准（可测、可验证）
 
 ## Phase 5 HighAccuracy 双评审（高精度任务必走）
-并行 fire 两个独立 subagent_review：
+并行 fire 两个独立 delegate_as review（role=momus 与 role=oracle，均 run_in_background=false）：
 - **Momus**（approval-biased）：计划清晰度、证据、可执行性；核文件存在、任务不矛盾、QA 场景具体。
 - **Oracle**（只读架构顾问）：独立审查。
 任一 REJECT → 修掉全部 cited 问题再重审（无上限重试，但少空转）；双 APPROVE → 通过。
 
 ## Phase 6 Atlas 执行（orchestrator，绝不 implementer）
 循环：Read Plan → 分解任务 → **Accumulate Wisdom**（把 boulder learnings 前向注入每次委托）
-→ 并行委托独立 worker（subagent_*，per-category）→ Verify（跑诊断）→ 未完回委托 → 全 done 汇报。
+→ 并行委托独立 worker（delegate_as，per-category 选角色）→ Verify（跑诊断）→ 未完回委托 → 全 done 汇报。
 - 用 \`omo_team_task\` 维护共享任务表/领取语义。
 - 每任务后把 learnings/decisions/issues/verifications 沉淀到 \`omo_note\`。
 
 ## Phase 7 验证 & 收尾
 - 跑验证清单，修到全绿。
-- \`omo_comment_check\`；\`omo_handoff\` 交接；汇报交付证据。`,
+- \`omo_comment_check\`；\`omo_handoff\` 交接；汇报交付证据。
 }
 
 const RULES: SkillRegistration = {
@@ -254,21 +255,21 @@ const SUBAGENT_ROLES: SkillRegistration = {
   source: 'runtime',
   content: `# omo-subagent-roles — OmO 子代理角色履职规范
 
-DSH 用 subagent_*（default/deep/review/librarian/oracle/plugin）作为 worker 池；本技能给出按 OmO 角色选型与注入的职责。
+DSH 统一派发通道是 delegate_as（OmO call_omo_agent 手感）：按角色查表 → 组纪律简报 → 派生并回收。本技能给出按 OmO 角色选型与注入的职责。
 
-## 角色 → DSH 工具 → 职责
-- **Oracle**（只读高智商架构顾问）→ subagent_oracle 或 subagent_deep。职责：复杂调试/架构评审；只读分析，不写代码不篡改。
-- **Librarian**（文档/OSS 检索）→ subagent_librarian。职责：查库 API/文档/外部仓库，输出引用与证据。
-- **Explore**（快速代码库梳理）→ subagent_default。职责：快速 grep/glob 扫描找模式与入口，给地图不给结论。
-- **Metis**（缺口分析）→ subagent_review。职责：计划定稿前抓隐形意图/歧义/AI-slop/验收缺口，输出必改清单。
-- **Momus**（无情评审，approval-biased）→ subagent_review。职责：核计划清晰度/证据/可执行性/文件存在/QA 具体；约 80% 清晰即可批。
-- **Multimodal-Looker**（视觉分析）→ subagent_default + describe-image。职责：截图/图/UI 分析，只读。
-- **Sisyphus-Junior**（workhorse worker）→ subagent_deep。职责：执行实现任务；不得再向下委派；严格 todo；交验证证据；不改计划文件。
+## 角色 → delegate_as → 职责
+- **Oracle**（只读高智商架构顾问）→ delegate_as role=oracle（只读通道，write/edit 宿主级禁）。职责：复杂调试/架构评审；只读分析，不写代码不篡改。
+- **Librarian**（文档/OSS 检索）→ delegate_as role=librarian（只读）。职责：查库 API/文档/外部仓库，输出引用与证据。
+- **Explore**（快速代码库梳理）→ delegate_as role=explore（只读）。职责：快速 grep/glob 扫描找模式与入口，给地图不给结论。
+- **Metis**（缺口分析）→ delegate_as role=metis。职责：计划定稿前抓隐形意图/歧义/AI-slop/验收缺口，输出必改清单。
+- **Momus**（无情评审，approval-biased）→ delegate_as role=momus（只读）。职责：核计划清晰度/证据/可执行性/文件存在/QA 具体；约 80% 清晰即可批。
+- **Multimodal-Looker**（视觉分析）→ omo_look_at + describe_image（视觉通道不是子代理）。职责：截图/图/UI 分析，只读。
+- **Sisyphus-Junior**（workhorse worker）→ delegate_as role=sisyphus-junior。职责：执行实现任务；不得再向下委派；严格 todo；交验证证据；不改计划文件。
 
 ## 使用姿势
-- 每个委托 brief 注入角色职责 paragraph + TASK/EXPECTED OUTCOME/STOP WHEN/EVIDENCE/MUST NOT DO。
+- 每个委托 brief 注入角色职责 paragraph + TASK/EXPECTED OUTCOME/STOP WHEN/EVIDENCE/MUST NOT DO/CONTEXT。
 - 校验 worker 返回的 EVIDENCE，不接受自报"完成"。
-- 连续 3 次失败：停、回滚、记录、升级（subagent_oracle）或询问用户。`,
+- 连续 3 次失败：停、回滚、记录、升级（delegate_as role=oracle）或询问用户。`,
 }
 
 const DELIVER: SkillRegistration = {
@@ -285,7 +286,7 @@ const DELIVER: SkillRegistration = {
 
 ## PR 式交接（无 PR 也按同一规范）
 - 写一份"PR 摘要"：what / why / how / 影响面 / 测试证据 / 风险与回滚。
-- 交给一个 review 视角（omo-hyperplan 的 Momus 或 subagent_review）批判性复查；修复其意见。
+- 交给一个 review 视角（omo-hyperplan 的 Momus 或 delegate_as role=momus）批判性复查；修复其意见。
 - 合入语义：直到证据全绿 + review 通过才算完成，绝不因差不多而停。
 
 ## ship 之后
@@ -392,8 +393,8 @@ const DEBUGGING: SkillRegistration = {
 
 ### 3. 两轮未破 -> 换角度
 - 连续 2 轮没有进展：停。从正交角度并行派子代理（一条消息内同时发出）：
-  - subagent_oracle：从架构/不变量角度找矛盾
-  - subagent_deep：换一个与当前完全不同的假设族（环境/并发/数据 vs 你一直在查的逻辑）
+  - delegate_as role=oracle：从架构/不变量角度找矛盾
+  - delegate_as role=hephaestus：换一个与当前完全不同的假设族（环境/并发/数据 vs 你一直在查的逻辑）
 - 用 omo_note section=issues 记录已排除路径，防止兜圈子。
 
 ### 4. 根因锁定
@@ -405,7 +406,7 @@ const DEBUGGING: SkillRegistration = {
 - 移除全部调试工件（登记过的逐项删）；交付说明：根因 / 证据 / 修复 / 测试。
 
 ## 提醒
-- DSH 侧工具：bash（复现/日志）、omo_lsp（诊断/定义/引用）、omo_code_search（AST 定位）、subagent_oracle/subagent_deep（换角度）。
+- DSH 侧工具：bash（复现/日志）、omo_lsp（诊断/定义/引用）、omo_code_search（AST 定位）、delegate_as role=oracle / role=hephaestus（换角度）。
 - 禁止：没复现就改代码；一次改多处；把"看起来对"当"验证过"。`,
 }
 
@@ -421,14 +422,14 @@ const REVIEW_WORK: SkillRegistration = {
 一段实现完成 ≠ 可以交付。用 5 个正交角度并行审查，全部通过才过。
 
 ## 并行 5 路（一条消息内全部发出，后台跑）
-1. **目标符合性**（subagent_oracle）：对照原始需求逐条核对"做了要做的、没做不要的"。输出 PASS/FAIL + 证据。
-2. **代码质量**（subagent_review）：diff 审查--错误处理、边界、命名、复杂度、与仓库既有约定的一致性（omo_rules compile 的规则为准）。
-3. **安全**（subagent_review）：注入/路径穿越/秘钥硬编码/不安全反序列化/权限放大。审查视角：攻击者怎么用它。
-4. **实操 QA**（subagent_default）：真实跑起来验证--构建/测试/最小使用路径。不是读代码说"应该行"，是执行出结果。
-5. **上下文挖掘**（subagent_librarian）：git log/blame、相关历史 issue（omo_note issues）、上游文档--有没有证据表明此改动踩过坑。
+1. **目标符合性**（delegate_as role=oracle，只读）：对照原始需求逐条核对"做了要做的、没做不要的"。输出 PASS/FAIL + 证据。
+2. **代码质量**（delegate_as role=momus，只读）：diff 审查--错误处理、边界、命名、复杂度、与仓库既有约定的一致性（omo_rules compile 的规则为准）。
+3. **安全**（delegate_as role=momus，只读）：注入/路径穿越/秘钥硬编码/不安全反序列化/权限放大。审查视角：攻击者怎么用它。
+4. **实操 QA**（delegate_as role=sisyphus-junior，可写）：真实跑起来验证--构建/测试/最小使用路径。不是读代码说"应该行"，是执行出结果。
+5. **上下文挖掘**（delegate_as role=librarian，只读）：git log/blame、相关历史 issue（omo_note issues）、上游文档--有没有证据表明此改动踩过坑。
 
 ## 委托简报必含
-TASK / EXPECTED OUTCOME（PASS/FAIL + 证据清单）/ STOP WHEN / EVIDENCE（命令输出或文件行号）/ MUST NOT DO（不许顺手改代码）。
+TASK / EXPECTED OUTCOME（PASS/FAIL + 证据清单）/ STOP WHEN / EVIDENCE（命令输出或文件行号）/ MUST NOT DO（不许顺手改代码）/ CONTEXT（背景与来源）。
 
 ## 收敛
 - 收齐 5 份结论：全 PASS -> 交付报告（各角度证据摘要）。
@@ -507,7 +508,7 @@ project/
 
 ## 流程（todo_write 逐段推进）
 ### 1. 并发探索
-- 立即并行发 subagent_default 后台探索：目录结构/入口点/依赖图/热点文件（每个简报自包含）。
+- 立即并行 delegate_as(role=explore) 后台探索：目录结构/入口点/依赖图/热点文件（每个简报自包含）。
 - 主线同时：bash 看构建与测试命令；read 既有 AGENTS.md / README；omo_code_search 摸核心约定。
 
 ### 2. 复杂度评分定位置
