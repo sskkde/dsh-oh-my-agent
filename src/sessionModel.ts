@@ -197,7 +197,8 @@ export async function setSessionMode(
  * 只扫描本 step 的消息（preStep 的 inbox.claim 只含本步新增），不会翻历史误触发。
  *
  * 映射：omo-ulw-plan → prometheus（规划态）；omo-start-work → atlas（执行态）；
- * omo-ultrawork → off（自动退出规划态；不换指挥，对齐原版 ultrawork 语义）。
+ * omo-ultrawork → off（自动退出规划态；不换指挥，对齐原版 ultrawork 语义）；
+ * omo-sisyphus → off（显式回到西西弗斯模式）。
  */
 export function sessionModeIntentOf(decision: AnyObj): { mode: SessionMode } | null {
   const messages = Array.isArray(decision.messages) ? decision.messages : []
@@ -226,7 +227,7 @@ export function sessionModeIntentOf(decision: AnyObj): { mode: SessionMode } | n
 function modeOfSkill(name: string): SessionMode | null {
   if (name === 'omo-ulw-plan') return 'prometheus'
   if (name === 'omo-start-work') return 'atlas'
-  if (name === 'omo-ultrawork') return 'off'
+  if (name === 'omo-ultrawork' || name === 'omo-sisyphus') return 'off'
   return null
 }
 

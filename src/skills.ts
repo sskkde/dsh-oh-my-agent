@@ -183,7 +183,21 @@ what happened before.`,
 }
 
 export function skillRegistrations(): SkillRegistration[] {
-  return [ULTRAWORK, START_WORK, RULES, HANDOFF_SKILL, HYPERPLAN, REFACTOR, REMOVE_AI_SLOPS, SUBAGENT_ROLES, DELIVER, MODEL_ROUTING, MEMORY, DEBUGGING, REVIEW_WORK, ULW_PLAN, INIT_DEEP, GIT_MASTER]
+  return [ULTRAWORK, START_WORK, RULES, HANDOFF_SKILL, HYPERPLAN, REFACTOR, REMOVE_AI_SLOPS, SUBAGENT_ROLES, DELIVER, MODEL_ROUTING, MEMORY, DEBUGGING, REVIEW_WORK, ULW_PLAN, INIT_DEEP, GIT_MASTER, SISYPHUS_RETURN]
+}
+
+const SISYPHUS_RETURN: SkillRegistration = {
+  name: 'omo-sisyphus',
+  description:
+    '回到西西弗斯模式：退出当前会话模式（prometheus 规划态 / atlas 执行态），还原默认模型、Sisyphus 编排纪律段与写门状态。',
+  whenToUse: '用户说"回到西西弗斯/退出规划/退出执行/还原默认模式"，或想结束 ulw-plan / start-work 的会话模式。',
+  invocation: { modelInvocable: true, userInvocable: true },
+  source: 'runtime',
+  content: `# omo-sisyphus — 回到西西弗斯模式
+
+退出当前会话模式并还原默认编排节奏：模型还原（切换前模型，无快照则会话默认）、写门恢复、系统提示回到 Sisyphus 编排纪律（omo:sisyphus-discipline）。
+
+插件在检测到本技能注入时自动执行还原；若未自动生效，调用 \`omo_session_model(state=off)\` 手动还原。`,
 }
 
 const MEMORY: SkillRegistration = {
