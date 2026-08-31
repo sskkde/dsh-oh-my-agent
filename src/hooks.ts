@@ -405,7 +405,9 @@ export async function omoPostExecute(
     if (hookEnabled(cfg, 'rules-injector') && cfg.rulesInjector && name === 'edit' && abs) {
       try {
         const block = compiledRulesFor(ws, fileRel ?? '')
-        if (block && block.length > 40) {
+        // Only inject when there is actual rule content ('' when no rules
+        // matched); never fire for an empty shell.
+        if (block && block.trim().length > 0) {
           extra.push(ctxMessage(`[OMO HOOK · rules] 适用于 ${fileRel} 的已编译规则，请遵守：\n${block.slice(0, 2500)}`))
         }
       } catch { /* contained */ }
