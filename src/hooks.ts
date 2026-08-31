@@ -17,7 +17,11 @@
  *       the target path as additional context (deduped per path, TTL-cached).
  *   - read-only planning gate  : agents whose preset is listed in
  *       hooks.read_only_agents may only write `*.md` inside `.omo/` (the
- *       Prometheus-style guard).
+ *       Prometheus-style guard). The same gate also fires while the
+ *       Prometheus planning mode is active on the session (sessionModel.ts):
+ *       write/edit/hashline writes are then limited to `*.md` under
+ *       hooks.plan_write_scopes (default ['.omo', '.agent-notes'] — planner
+ *       docs plus boulder watermarks).
  *   - edit-error-recovery      : when an edit-family tool fails, inject a
  *       STOP-read-verify-correct reminder (OmO edit-error-recovery); a per
  *       (tool,file) failure ledger escalates to "switch method" after 2 fails.
@@ -45,6 +49,7 @@ import { loadLayeredConfig } from './omoconfig.js'
 import { refreshRulesState } from './rules.js'
 import { checkComments } from './commentCheck.js'
 import { MonitorRegistry } from './monitor.js'
+import { isPlanningActive } from './sessionModel.js'
 
 export interface HookEvent {
   ts: string
@@ -84,6 +89,8 @@ export interface HooksConfig {
   commentChecker: CommentMode
   rulesInjector: boolean
   readOnlyAgents: string[]
+  /** 规划态动态写入门允许的相对目录（须以 `.md` 结尾才放行）。 */
+  planWriteScopes: string[]
   editErrorRecovery: boolean
   jsonErrorRecovery: boolean
   monitorStatusInjector: boolean
@@ -96,6 +103,7 @@ const DEFAULT_HOOKS: HooksConfig = {
   commentChecker: 'warn',
   rulesInjector: true,
   readOnlyAgents: [],
+  planWriteScopes: ['.omo', '.agent-notes'],
   editErrorRecovery: true,
   jsonErrorRecovery: true,
   monitorStatusInjector: true,
@@ -126,6 +134,8 @@ export function hooksConfigFor(ws: string, execWsHint?: string): HooksConfig {
 
   const rulesInjector = typeof h.rules_injector === 'boolean' ? h.rules_injector : DEFAULT_HOOKS.rulesInjector
   const readOnlyAgents = Array.isArray(h.read_only_agents) ? (h.read_only_agents as unknown[]).map(String) : []
+  // 显式数组即采用（空数组=规划态只读门全禁写）；非数组回默认
+  const planWriteScopes = Array.isArray(h.plan_write_scopes) ? (h.plan_write_scopes as unknown[]).map(String).filter((s) => s.length > 0) : DEFAULT_HOOKS.planWriteScopes
 
   // resilience/UX hooks default ON; `hooks.<name>: false` (or any falsy) turns them off
   const editErrorRecovery = h.edit_error_recovery === false ? false : DEFAULT_HOOKS.editErrorRecovery
@@ -138,6 +148,7 @@ export function hooksConfigFor(ws: string, execWsHint?: string): HooksConfig {
     commentChecker,
     rulesInjector,
     readOnlyAgents,
+    planWriteScopes,
     editErrorRecovery,
     jsonErrorRecovery,
     monitorStatusInjector,
@@ -177,7 +188,8 @@ function fileOf(args: ExecLike['arguments']): string | null {
 }
 
 const READ_TOOLS = new Set(['read'])
-const WRITE_TOOLS = new Set(['write', 'edit'])
+/** 落盘工具族：write/edit + 行锚编辑（读-改-写一体，必须与 write/edit 同门）。 */
+const WRITE_TOOLS = new Set(['write', 'edit', 'omo_hashline_edit'])
 /** Edit-family tools whose failures route to edit-error-recovery. */
 const EDIT_FAMILY = new Set(['write', 'edit', 'omo_hashline_edit'])
 
@@ -288,14 +300,19 @@ export async function omoPreExecute(
       }
     }
 
-    // 2) read-only planning gate (Prometheus-style)
-    if (hookEnabled(cfg, 'read-only-gate') && cfg.readOnlyAgents.includes(agentPresetOf(exec)) && WRITE_TOOLS.has(name) && abs) {
-      const withinOmo = isWithin(path.join(ws, '.omo'), abs)
+    // 2) read-only planning gate (Prometheus-style, static preset list + dynamic planning mode)
+    const presetGated = cfg.readOnlyAgents.includes(agentPresetOf(exec))
+    const planningGated = isPlanningActive(exec.agent)
+    if (hookEnabled(cfg, 'read-only-gate') && (presetGated || planningGated) && WRITE_TOOLS.has(name) && abs) {
       const isMarkdown = /\.md$/i.test(abs)
-      const allowed = withinOmo && isMarkdown
+      const allowed = presetGated
+        ? isWithin(path.join(ws, '.omo'), abs) && isMarkdown
+        : cfg.planWriteScopes.some((scope) => scope && isWithin(path.join(ws, scope), abs)) && isMarkdown
       if (!allowed) {
-        pushLog('read-only-gate', name, fileRel || '', 'deny', 'planner agent may only write *.md under .omo/')
-        return { kind: 'deny', reason: `[omo_hooks] read-only-gate: agent "${String(agentPresetOf(exec))}" is read-only; may only write markdown under .omo/.` }
+        const who = presetGated ? `agent "${String(agentPresetOf(exec))}"` : 'planning mode (Prometheus)'
+        const scopeDesc = presetGated ? '.omo/' : cfg.planWriteScopes.join('、') || '(none)'
+        pushLog('read-only-gate', name, fileRel || '', 'deny', `${who}: may only write *.md under ${scopeDesc}`)
+        return { kind: 'deny', reason: `[omo_hooks] read-only-gate: ${who} may only write markdown under ${scopeDesc}; target "${fileRel}" denied.` }
       }
     }
 
