@@ -1216,7 +1216,7 @@ function buildTools(config: Config): ToolDefinition[] {
   tools.push(
     tool(
       'omo_agents',
-      '差异化 agent 角色库（复刻 OmO 11-agent 体系：sisyphus/prometheus/atlas/oracle/librarian/explore/metis/momus/hephaestus/multimodal-looker/sisyphus-junior）。action=list 看角色清单（职责/category 模型路线/推荐 DSH 委托工具）；action=brief role=<名> task=<任务> files=[...] 生成完整委托简报（角色 prompt + 纪律 + 停止条件 + 证据要求 + category 模型绑定），复制给对应 subagent_* 工具执行；action=team goal=<目标> members=[角色...] 生成 agent_teams 建队方案（含每成员 provider/model 绑定与派发步骤）。',
+      '差异化 agent 角色库（复刻 OmO 11-agent 体系：sisyphus/prometheus/atlas/oracle/librarian/explore/metis/momus/hephaestus/multimodal-looker/sisyphus-junior）。action=list 看角色清单（职责/category 模型路线/推荐 DSH 委托工具）；action=brief role=<名> task=<任务> files=[...] 生成完整委托简报（角色 prompt + 纪律 + 停止条件 + 证据要求 + category 模型绑定），可直接用 delegate_as(role=<名>) 一键派发执行；action=team goal=<目标> members=[角色...] 生成 agent_teams 建队方案（含每成员 provider/model 绑定与派发步骤）。',
       {
         action: { type: 'string', enum: ['list', 'brief', 'team'], required: true, default: 'list' },
         role: { type: 'string', description: 'brief 时必填：角色名（见 list）' },
@@ -1263,7 +1263,7 @@ function buildTools(config: Config): ToolDefinition[] {
           return {
             ok: true,
             action,
-            roles: AGENT_ROLES.map((r) => ({ name: r.name, title: r.title, mission: r.mission, category: r.category, dshTool: r.dshTool, when: r.when })),
+            roles: AGENT_ROLES.map((r) => ({ name: r.name, title: r.title, mission: r.mission, category: r.category, dshTool: (r.name === 'sisyphus' || r.name === 'multimodal-looker') ? r.dshTool : `delegate_as role=${r.name}`, when: r.when })),
             note: '用 action=brief 生成委托简报；action=team 生成建队方案',
           }
         }
@@ -1273,7 +1273,7 @@ function buildTools(config: Config): ToolDefinition[] {
           const task = String(args.task || '')
           if (!task.trim()) return { ok: false, action, note: 'task required' }
           const files = Array.isArray(args.files) ? (args.files as unknown[]).map(String) : []
-          return { ok: true, action, brief: buildBrief(role, task, files, modelCfg), note: `简报已生成（${role.dshTool}）` }
+          return { ok: true, action, brief: buildBrief(role, task, files, modelCfg), note: `简报已生成（可经 delegate_as role=${role.name} 一键派发）` }
         }
         // team
         const goal = String(args.task || args.goal || '')

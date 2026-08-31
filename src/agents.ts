@@ -2,16 +2,17 @@
  * Agent roster - OmO's 11 differentiated agents, ported as a role archive.
  *
  * Upstream gives each agent its own prompt builder, model binding, and tool
- * restrictions inside the OpenCode host. DSH's native subagent_* tools already
- * carry the delegation transport; what this module ports is the DIFFERENTIAL
- * layer: per-role mission prompts, the category -> model binding decision
- * (resolved through omo_model_route), and the discipline rails that OmO bakes
- * into every agent (MUST / STOP WHEN / EVIDENCE).
+ * restrictions inside the OpenCode host. DSH's delegation transport is the
+ * plugin's `delegate_as` tool (role table → brief → subagents service); what
+ * this module ports is the DIFFERENTIAL layer: per-role mission prompts, the
+ * category -> model binding decision (resolved through omo_model_route), and
+ * the discipline rails that OmO bakes into every agent (MUST / STOP WHEN /
+ * EVIDENCE).
  *
  * Surface: the `omo_agents` tool.
- *   - list   : the roster with roles, categories, and target DSH tools
- *   - brief  : a complete delegation brief for one role (paste into the
- *              matching subagent_* tool's prompt)
+ *   - list   : the roster with roles, categories, and delegation channels
+ *   - brief  : a complete delegation brief for one role (delegate_as builds
+ *              it automatically from role + task)
  *   - team   : an agent_teams setup plan with per-member provider/model binding
  */
 
@@ -230,7 +231,7 @@ export function buildBrief(
   lines.push(role.evidence)
   lines.push('')
   lines.push(`## 模型路线（category=${role.category}）`)
-  lines.push(`本任务选型：${route}。委托工具支持 provider/model 参数时请按此传入；不支持则按此难度预期执行。`)
+  lines.push(`本任务选型：${route}。delegate_as 会自动按角色三级路由（delegate_roles > categories > 档位）选脑，本行仅供预期参考。`)
   return lines.join('\n')
 }
 

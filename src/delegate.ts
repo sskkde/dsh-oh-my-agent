@@ -45,11 +45,11 @@ interface ChannelSpec {
 
 /** AGENT_ROLES.dshTool → 通道规格。 */
 const CHANNEL_BY_DSH_TOOL: Record<string, ChannelSpec> = {
-  subagent_default: { id: 'default', nativeTool: 'subagent_default', tier: 'flash', readOnly: false },
-  subagent_librarian: { id: 'librarian', nativeTool: 'subagent_librarian', tier: 'flash', readOnly: true },
-  subagent_review: { id: 'review', nativeTool: 'subagent_review', tier: 'flash', readOnly: true },
-  subagent_deep: { id: 'deep', nativeTool: 'subagent_deep', tier: 'heavy', readOnly: false },
-  subagent_oracle: { id: 'oracle', nativeTool: 'subagent_oracle', tier: 'heavy', readOnly: true },
+  subagent_default: { id: 'default', nativeTool: 'delegate_as(role=default)', tier: 'flash', readOnly: false },
+  subagent_librarian: { id: 'librarian', nativeTool: 'delegate_as(role=librarian)', tier: 'flash', readOnly: true },
+  subagent_review: { id: 'review', nativeTool: 'delegate_as(role=review)', tier: 'flash', readOnly: true },
+  subagent_deep: { id: 'deep', nativeTool: 'delegate_as(role=deep)', tier: 'heavy', readOnly: false },
+  subagent_oracle: { id: 'oracle', nativeTool: 'delegate_as(role=oracle)', tier: 'heavy', readOnly: true },
 }
 
 /** 不可经子代理派发的角色及原因（如实拒绝，不硬造通道）。 */
