@@ -64,9 +64,9 @@ until the task is done.
   return only when the goal is actually done.
 - Report done to the user.
 
-## 会话模型（规划态还原）
-本技能启动=进入自主执行：插件的规划态自动关闭（会话模型还原、写入门打开）。
-若未自动生效，调用 \`omo_session_model(state=off)\` 手动还原。`,
+## 会话模型（自动退出规划态）
+触发本技能自动退出 Prometheus 规划态：会话模型还原到切换前（或会话默认），写门打开。
+不切换执行态、不换指挥——需要 Atlas 执行编排请走 start-work。若本不在规划态则无操作。`,
 }
 
 const START_WORK: SkillRegistration = {
@@ -118,9 +118,10 @@ interview with what you learned. Stop asking once genuinely-blocking unknowns ar
 - 跑验证清单，修到全绿。
 - \`omo_comment_check\`；\`omo_handoff\` 交接；汇报交付证据。
 
-## 会话模型（规划态还原）
-进入本技能=用户已批准计划、进入执行：插件的规划态自动关闭——当前会话模型还原到切换前（或会话默认），写入门打开。
-若未自动生效，调用 \`omo_session_model(state=off)\` 手动还原。`,
+## 会话模型（Atlas 执行态）
+进入本技能=用户已批准计划、进入执行：插件自动切换为 **Atlas 执行态**——会话模型切到 Atlas 角色路由
+（delegate_roles.atlas > categories.ultrabrain > heavy 档），系统提示注入 Atlas 执行纪律段（omo:atlas-execution），写门打开。
+若未自动生效，调用 \`omo_session_model(state=atlas)\` 手动开启；结束后 \`omo_session_model(state=off)\` 还原默认。`,
 }
 
 const RULES: SkillRegistration = {
@@ -488,7 +489,7 @@ const ULW_PLAN: SkillRegistration = {
 ## 会话模型（规划态）
 进入本技能时插件的规划态自动开启：当前会话模型切到 Prometheus 角色路由（delegate_roles.prometheus > categories.deep > heavy 档），
 写入门同时关闭（write/edit/hashline 只允许 plan_write_scopes 内 *.md）。若未自动生效，调用 \`omo_session_model(state=on)\` 手动开启。
-批准执行（进入 start-work / ultrawork）时规划态自动还原；也可用 \`omo_session_model(state=off)\` 手动还原。全程只写 .omo/ 下计划工件。
+计划获批进入 start-work 后自动切换为 **Atlas 执行态**（模型 + 执行纪律注入）；经 \`omo_session_model(state=off)\` 可随时还原默认。全程只写 .omo/ 下计划工件。
 
 ## 判据
 好计划 = 执行者拿到后**一个问题都不用问**。做不到就回炉继续探索/追问。`,

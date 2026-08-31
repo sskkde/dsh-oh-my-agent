@@ -11,10 +11,11 @@
  * hyperplan / refactor / remove-ai-slops / debugging / review-work / init-deep
  * / git-master), and a JSON API for the client panel (/dsh-oh-my-agent/api/*).
  *
- * Planning mode (Plugin source, Prometheus): invoking the omo-ulw-plan skill
- * switches this session's model to the prometheus role route (omoconfig-driven)
- * and closes the write gate to plan artifacts; start-work/ultrawork invocation
- * reverts both. Manual fallback tool: omo_session_model.
+ * Session modes (Plugin source): /omo-ulw-plan → prometheus planning mode
+ * (model = prometheus role route, write gate closed to plan artifacts);
+ * /omo-start-work → atlas execution mode (model = atlas role route, atlas
+ * discipline section injected, gate open); /omo-ultrawork → auto-exit planning
+ * (revert, no agent switch). Manual fallback tool: omo_session_model.
  *
  * Everything an agent-facing tool persists lands under `<workspace>/.omo/`
  * (the same state-dir convention OmO uses).
@@ -43,7 +44,8 @@ import { docsSearch, docsGet } from './docs.js'
 import { lookAt, LOOK_INTENTS } from './lookAt.js'
 import { registerSkills, listRegistered } from './dynamicSkills.js'
 import { omoPreExecute, omoPostExecute, hooksStatus, type HooksConfig } from './hooks.js'
-import { prometheusPlanRoute, planningIntentOf, setPlanning, type ModelConfig } from './sessionModel.js'
+import { roleModelRoute, prometheusPlanRoute, sessionModeIntentOf, setSessionMode, sessionModeOf, type SessionMode, type ModelConfig } from './sessionModel.js'
+import { ATLAS_SECTION } from './atlasPrompt.js'
 import * as mem from './memory.js'
 import { MonitorRegistry } from './monitor.js'
 import { createUltraPlan, updateUltraPhase, ultraworkPhaseText, readUltraPlan, recordWaveProgress, type UltraPhase, type Wave } from './ultrawork.js'
@@ -90,7 +92,7 @@ interface SkillsCtx { skills: { register(d: unknown): unknown } }
 /** dsh-system-prompt service surface (loose; optional on the ctx). */
 interface SysPromptCtx {
   systemPrompt?: {
-    section(s: { name: string; order: number; text: string; complete?: boolean }): () => void
+    section(s: { name: string; order: number; text: string | ((context: { agent?: unknown }) => string); complete?: boolean }): () => void
   }
 }
 
@@ -1230,34 +1232,39 @@ function buildTools(config: Config): ToolDefinition[] {
     ),
   )
 
-  // ─────────────────────── omo_session_model (规划态会话模型) ─────────
+  // ─────────────────────── omo_session_model (会话级模式) ──────────────
   tools.push(
     tool(
       'omo_session_model',
-      'Prometheus 规划态会话模型开关。state=on：把当前会话模型切到 Prometheus 角色路由（delegate_roles.prometheus > categories.deep > heavy 档），并开启规划写入门（write/edit/hashline 仅能写 plan_write_scopes 内 *.md）；state=off：还原切换前模型（或会话默认），并开门。规划态通常由 /omo-ulw-plan 自动开启、start-work/ultrawork 自动关闭；本工具用于手动兜底与状态确认。生效时序与官方 selectModel 同语义：从切换后的下一次请求生效。',
+      '会话级模式开关（model change + 注入段联动）。state=prometheus：规划态——模型切 Prometheus 角色路由（delegate_roles.prometheus > categories.deep > heavy 档）并开启规划写入门（write/edit/hashline 仅能写 plan_write_scopes 内 *.md）；state=atlas：执行态——模型切 Atlas 角色路由（delegate_roles.atlas > categories.ultrabrain > heavy 档）并注入 Atlas 执行纪律段（omo:atlas-execution），写门开；state=off：还原切换前模型（或会话默认）、注入段消失。模式通常由技能注入自动切换（/omo-ulw-plan→规划态、/omo-start-work→执行态、/omo-ultrawork→自动退出规划态）；本工具用于手动兜底与状态确认。生效时序与官方 selectModel 同语义：从切换后的下一次请求生效。',
       {
-        state: { type: 'string', enum: ['on', 'off'], required: true, description: 'on=进入规划态（切模型+关写门）；off=还原（模型还原+开写门）' },
+        state: { type: 'string', enum: ['off', 'on', 'atlas'], required: true, description: 'off=还原默认；on=prometheus 规划态（向后兼容别名）；atlas=执行态' },
       },
       {
         type: 'object',
         additionalProperties: false,
         properties: {
           ok: { type: 'boolean' },
+          mode: { type: 'string' },
           active: { type: 'boolean' },
           route: { type: 'string' },
           source: { type: 'string' },
           reason: { type: 'string' },
         },
       },
-      (_a, v) => text(v.ok ? `规划态: ${String(v.active ? 'ON（规划模型）' : 'OFF（已还原）')}  route=${String(v.route || '')}${v.source ? `（${v.source}）` : ''}` : `切换失败: ${String(v.reason || '')}`),
+      (_a, v) => {
+        const label = v.mode === 'atlas' ? 'Atlas 执行态' : v.mode === 'prometheus' ? 'Prometheus 规划态' : 'OFF（已还原）'
+        return text(v.ok ? `会话模式: ${String(label)}${v.route ? `  route=${String(v.route)}` : ''}${v.source ? `（${v.source}）` : ''}` : `切换失败: ${String(v.reason || '')}`)
+      },
       async (args, exec) => {
-        const state = String(args.state || 'off')
+        const raw = String(args.state || 'off')
+        const mode: SessionMode = raw === 'atlas' ? 'atlas' : raw === 'on' ? 'prometheus' : 'off'
         const ws = wsFromExec(config, exec)
         const merged = loadLayeredConfig(ws).merged
         const routes: DelegateRoutes = { provider: config.delegateProvider, flash: config.delegateFlashRoute, heavy: config.delegateHeavyRoute }
-        const planRoute = prometheusPlanRoute(merged, routes)
-        const r = await setPlanning(exec.agent, state === 'on', planRoute, defaultsSelection())
-        const out: AnyObj = { ok: r.ok, active: r.active ?? false }
+        const route = mode === 'atlas' ? roleModelRoute('atlas', merged, routes) : mode === 'prometheus' ? prometheusPlanRoute(merged, routes) : undefined
+        const r = await setSessionMode(exec.agent, mode, route, defaultsSelection())
+        const out: AnyObj = { ok: r.ok, mode: r.mode ?? mode, active: r.mode !== 'off' }
         if (r.route) out.route = `${r.route.provider}/${r.route.model}`
         if (r.source) out.source = r.source
         if (r.reason) out.reason = r.reason
@@ -1831,7 +1838,7 @@ export function apply(ctx: Context, config: Config): void {
     }
   }, 'dsh-oh-my-agent: hooks listeners')
 
-  // Prometheus 规划态：会话模型自动切换（skill 注入/调用路径 → pre-step 检测）
+  // 会话级模式切换：skill 注入/调用路径 → pre-step 检测（prometheus 规划态 / atlas 执行态 / ultrawork 退态）
   ctx.effect(() => {
     const anyCtx = ctx as unknown as { on: (ev: string, fn: unknown) => (() => void) | undefined }
     const c = anyCtx.on('agent/pre-step', async (payload: unknown, next: unknown) => {
@@ -1840,29 +1847,31 @@ export function apply(ctx: Context, config: Config): void {
       try {
         const agent = (payload as AnyObj | undefined)?.agent
         if (!agent) return decision
-        const intent = planningIntentOf(decision as AnyObj)
+        const intent = sessionModeIntentOf(decision as AnyObj)
         if (!intent) return decision
         const cwd = ((agent as { session?: { header?: { cwd?: string } } }).session)?.header?.cwd
         const ws = wsForConfig(config, cwd)
         const merged = loadLayeredConfig(ws).merged
         const routes: DelegateRoutes = { provider: config.delegateProvider, flash: config.delegateFlashRoute, heavy: config.delegateHeavyRoute }
-        const planRoute = prometheusPlanRoute(merged, routes)
-        const r = await setPlanning(agent, intent === 'on', planRoute, defaultsSelection())
+        const mode: SessionMode = intent.mode
+        const route = mode === 'atlas' ? roleModelRoute('atlas', merged, routes) : mode === 'prometheus' ? prometheusPlanRoute(merged, routes) : undefined
+        const r = await setSessionMode(agent, mode, route, defaultsSelection())
+        const modeLabel = mode === 'atlas' ? 'atlas 执行态' : mode === 'prometheus' ? 'prometheus 规划态' : 'off（还原默认）'
         if (!r.ok) {
-          ctx.logger?.warn?.(`[dsh-oh-my-agent] planning mode ${intent} failed: ${String(r.reason ?? '')}`)
+          ctx.logger?.warn?.(`[dsh-oh-my-agent] session mode → ${modeLabel} failed: ${String(r.reason ?? '')}`)
         } else {
-          ctx.logger?.info?.(`[dsh-oh-my-agent] planning mode ${intent === 'on' ? 'ON' : 'OFF'}（route=${r.route?.provider}/${r.route?.model}${r.source ? `, source=${r.source}` : ''}）`)
+          ctx.logger?.info?.(`[dsh-oh-my-agent] session mode → ${modeLabel}（${r.route ? `route=${r.route.provider}/${r.route.model}, ` : ''}${r.source ? `source=${r.source}` : r.route ? 'noop' : ''}）`)
         }
       } catch (e) {
-        // 规划态切换绝不破坏步骤本身
-        ctx.logger?.warn?.(`[dsh-oh-my-agent] planning pre-step switch error: ${String(e)}`)
+        // 模式切换绝不破坏步骤本身
+        ctx.logger?.warn?.(`[dsh-oh-my-agent] session-mode pre-step switch error: ${String(e)}`)
       }
       return decision
     })
     return () => {
       try { if (typeof c === 'function') c() } catch { /* ignore */ }
     }
-  }, 'dsh-oh-my-agent: planning-mode session switch')
+  }, 'dsh-oh-my-agent: session-mode switch')
 
   // main-session system-prompt section (dsh-system-prompt channel).
   // Registered on the plugin's own long-lived fiber so the section persists;
@@ -1890,6 +1899,21 @@ export function apply(ctx: Context, config: Config): void {
       } catch (e) {
         ctx.logger?.warn?.(`[dsh-oh-my-agent] main-prompt section registration failed: ${String(e)}`)
       }
+    }
+  }
+
+  // Atlas 执行态动态段：仅在会话处于 atlas 模式时随请求组装（函数式 text，
+  // 与 dsh-plan-mode 的 plan:policy 同型；模式切换下一次请求生效）
+  if (typeof spCtx.systemPrompt?.section === 'function') {
+    try {
+      regOnce(ctx, () => spCtx.systemPrompt!.section({
+        name: 'omo:atlas-execution',
+        order: 50,
+        text: (context) => (context?.agent !== undefined && sessionModeOf(context.agent) === 'atlas') ? ATLAS_SECTION : '',
+      }), 'dsh-oh-my-agent: atlas-execution section')
+      ctx.logger?.info?.('[dsh-oh-my-agent] atlas-execution section registered (name=omo:atlas-execution, order=50, dynamic)')
+    } catch (e) {
+      ctx.logger?.warn?.(`[dsh-oh-my-agent] atlas-execution section registration failed: ${String(e)}`)
     }
   }
 
