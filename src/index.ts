@@ -6,16 +6,17 @@
  * monitors, ultrawork conductor, handoff, team task table, layered config,
  * codegraph, lsp, model routing, planning-mode session switch, hooks
  * introspection, agent roster/briefs, context7 docs, look-at orchestrator,
- * dynamic SKILL.md loader), 16 runtime skills (ultrawork / start-work / ulw-plan
+ * dynamic SKILL.md loader), 17 runtime skills (ultrawork / start-work / ulw-plan
  * / rules / handoff / memory / model-routing / subagent-roles / deliver /
  * hyperplan / refactor / remove-ai-slops / debugging / review-work / init-deep
- * / git-master), and a JSON API for the client panel (/dsh-oh-my-agent/api/*).
+ * / git-master / sisyphus-return), and a JSON API for the client panel (/dsh-oh-my-agent/api/*).
  *
  * Session modes (Plugin source): /omo-ulw-plan → prometheus planning mode
  * (model = prometheus role route, write gate closed to plan artifacts);
  * /omo-start-work → atlas execution mode (model = atlas role route, atlas
  * discipline section injected, gate open); /omo-ultrawork → auto-exit planning
- * (revert, no agent switch). Manual fallback tool: omo_session_model.
+ * and /omo-sisyphus → return to default (revert, no agent switch).
+ * Manual fallback tool: omo_session_model.
  *
  * Everything an agent-facing tool persists lands under `<workspace>/.omo/`
  * (the same state-dir convention OmO uses).
