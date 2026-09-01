@@ -100,7 +100,9 @@ const START_WORK: SkillRegistration = {
 - 并行默认：独立任务一条消息全发，只排命名依赖。
 - 每波验收：读回变更文件 + 跑验证命令 + 重读计划；全绿才把 checkbox 勾 \`- [x]\` 再推进。
 - 失败续跑：send_message 回同一子代理补交付物；同一波连续 3 次失败：停止、回退、记录、换代。
-- 收尾 Final Wave：验证清单全绿 + 评审（delegate_as role=momus）APPROVE 才报完成；交付报告含变更清单与 Final Wave 结论。
+- 收尾 Final Wave：验证清单全绿 + 独立验证者全部 APPROVE 才报完成——裁决者**优先 role=metis**（只读验收核验），
+  仅当用户明确指定时才用 role=oracle；实操核验可配 role=sisyphus-junior 真实跑验证；执行者（本人与实现 worker）不得自评。
+  交付报告含变更清单与 Final Wave 结论。
 - 每任务后把 learnings/decisions/issues/verifications 沉淀到 \`omo_note\`；收尾 \`omo_comment_check\` + \`omo_handoff\`。`,
 }
 
@@ -265,7 +267,7 @@ DSH 统一派发通道是 delegate_as（OmO call_omo_agent 手感）：按角色
 - **Librarian**（文档/OSS 检索）→ delegate_as role=librarian（只读）。职责：查库 API/文档/外部仓库，输出引用与证据。
 - **Explore**（快速代码库梳理）→ delegate_as role=explore（只读）。职责：快速 grep/glob 扫描找模式与入口，给地图不给结论。
 - **Metis**（缺口分析）→ delegate_as role=metis。职责：计划定稿前抓隐形意图/歧义/AI-slop/验收缺口，输出必改清单。
-- **Momus**（无情评审，approval-biased）→ delegate_as role=momus（只读）。职责：核计划清晰度/证据/可执行性/文件存在/QA 具体；约 80% 清晰即可批。
+- **Momus**（计划评审，approval-biased）→ delegate_as role=momus（只读）。只审 .omo/plans/*.md（输入须含恰一条计划路径，内联/TODO 拒评）；核引用/可执行性/QA 场景，约 80% 清晰即可批。代码/工作评审不派 Momus——用 role=oracle。
 - **Multimodal-Looker**（视觉分析）→ omo_look_at + describe_image（视觉通道不是子代理）。职责：截图/图/UI 分析，只读。
 - **Sisyphus-Junior**（workhorse worker）→ delegate_as role=sisyphus-junior。职责：执行实现任务；不得再向下委派；严格 todo；交验证证据；不改计划文件。
 
@@ -289,7 +291,7 @@ const DELIVER: SkillRegistration = {
 
 ## PR 式交接（无 PR 也按同一规范）
 - 写一份"PR 摘要"：what / why / how / 影响面 / 测试证据 / 风险与回滚。
-- 交给一个 review 视角（omo-hyperplan 的 Momus 或 delegate_as role=momus）批判性复查；修复其意见。
+- 交给独立批判性复查（delegate_as role=oracle，只读）审查 PR 摘要与工作成果；修复其意见。
 - 合入语义：直到证据全绿 + review 通过才算完成，绝不因差不多而停。
 
 ## ship 之后
@@ -426,8 +428,8 @@ const REVIEW_WORK: SkillRegistration = {
 
 ## 并行 5 路（一条消息内全部发出，后台跑）
 1. **目标符合性**（delegate_as role=oracle，只读）：对照原始需求逐条核对"做了要做的、没做不要的"。输出 PASS/FAIL + 证据。
-2. **代码质量**（delegate_as role=momus，只读）：diff 审查--错误处理、边界、命名、复杂度、与仓库既有约定的一致性（omo_rules compile 的规则为准）。
-3. **安全**（delegate_as role=momus，只读）：注入/路径穿越/秘钥硬编码/不安全反序列化/权限放大。审查视角：攻击者怎么用它。
+2. **代码质量**（delegate_as role=oracle，只读）：diff 审查--错误处理、边界、命名、复杂度、与仓库既有约定的一致性（omo_rules compile 的规则为准）。
+3. **安全**（delegate_as role=oracle，只读）：注入/路径穿越/秘钥硬编码/不安全反序列化/权限放大。审查视角：攻击者怎么用它。
 4. **实操 QA**（delegate_as role=sisyphus-junior，可写）：真实跑起来验证--构建/测试/最小使用路径。不是读代码说"应该行"，是执行出结果。
 5. **上下文挖掘**（delegate_as role=librarian，只读）：git log/blame、相关历史 issue（omo_note issues）、上游文档--有没有证据表明此改动踩过坑。
 

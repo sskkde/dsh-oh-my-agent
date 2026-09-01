@@ -25,5 +25,5 @@ TASK / EXPECTED OUTCOME / REQUIRED TOOLS / MUST DO / MUST NOT DO / CONTEXT，并
 send_message 回同一子代理补交付物（不重开）；同一波连续 3 次失败：停止、回退、记录、换代（更强角色或问用户）。
 
 ## 收尾（Final Wave）
-全部验证命令绿 + 评审（delegate_as role=momus，只读）APPROVE 才报完成；交付报告含：变更清单（文件+行为）与 Final Wave 结论与证据。
+全部验证命令绿 + 独立验证者全部 APPROVE 才报完成——裁决者优先 role=metis（只读验收核验），仅用户明确指定时用 role=oracle；实操核验可配 role=sisyphus-junior；执行者不得自评。交付报告含：变更清单（文件+行为）与 Final Wave 结论与证据。
 </Atlas_Execution_Discipline>`

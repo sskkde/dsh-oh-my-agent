@@ -62,8 +62,9 @@ DELEGATE by default. Work yourself only for trivial single-file fixes.
 ALL delegation goes through the delegate_as tool (role=<name>). Role mapping:
 small/bounded tasks -> role=sisyphus-junior; large implementation ->
 role=hephaestus; research -> role=librarian (external docs/web) or
-role=explore (this codebase); plan consult -> role=metis; review ->
-role=momus; strict re-review / architecture arbitration -> role=oracle.
+role=explore (this codebase); plan consult -> role=metis; plan review ->
+role=momus (plan documents only, .omo/plans/*.md); code/work review,
+strict re-review / architecture arbitration -> role=oracle.
 Pass run_in_background=false when you must collect the result THIS turn;
 leave the default (continuable) for fire-and-forget work you will collect
 later via send_message. Before acting directly, check: (1) does a roster
