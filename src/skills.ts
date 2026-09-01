@@ -64,6 +64,15 @@ until the task is done.
   return only when the goal is actually done.
 - Report done to the user.
 
+## 完成协定（Oracle 验证门——系统级，非可选）
+1. 你认为工作完成时，输出 \`<promise>DONE</promise>\`——这**不结束循环**。
+2. 必须立即派**独立 Oracle 验证**：\`delegate_as(role=oracle, run_in_background=false)\`，验证 prompt 至少含：原任务、变更清单、验证命令输出、手工 QA 证据；要求核验"是否真完成/有无隐藏缺口/证据是否可信"（怀疑默认不完成）。
+3. 仅当 Oracle 验证**通过**后，输出 \`<promise>VERIFIED</promise>\` 结束循环；不通过 → 按 Oracle 指出的缺口修复 → 重送验证（同会话续派，不重开）。
+4. 系统钩子会在检测到未经验证的 \`<promise>DONE</promise>\` 时持续注入提醒——不要试图绕过。
+
+## 中止
+用户说 \`/omo-cancel-ultrawork\` 或"停止/取消"：立即停止循环——清 boulder activePlan（omo_ultrawork cancel=true）、还原会话模式（omo_session_model state=off）、简要交代已完成的与未完成的，然后停。
+
 ## 会话模型（自动退出规划态）
 触发本技能自动退出 Prometheus 规划态：会话模型还原到切换前（或会话默认），写门打开。
 不切换执行态、不换指挥——需要 Atlas 执行编排请走 start-work。若本不在规划态则无操作。`,
@@ -165,7 +174,22 @@ what happened before.`,
 }
 
 export function skillRegistrations(): SkillRegistration[] {
-  return [ULTRAWORK, START_WORK, RULES, HANDOFF_SKILL, HYPERPLAN, REFACTOR, REMOVE_AI_SLOPS, SUBAGENT_ROLES, DELIVER, MODEL_ROUTING, MEMORY, DEBUGGING, REVIEW_WORK, ULW_PLAN, INIT_DEEP, GIT_MASTER, SISYPHUS_RETURN]
+  return [ULTRAWORK, START_WORK, RULES, HANDOFF_SKILL, HYPERPLAN, REFACTOR, REMOVE_AI_SLOPS, SUBAGENT_ROLES, DELIVER, MODEL_ROUTING, MEMORY, DEBUGGING, REVIEW_WORK, ULW_PLAN, INIT_DEEP, GIT_MASTER, SISYPHUS_RETURN, CANCEL_ULTRAWORK]
+}
+
+const CANCEL_ULTRAWORK: SkillRegistration = {
+  name: 'omo-cancel-ultrawork',
+  description: '停止 ultrawork / 自主执行循环：清 boulder activePlan 水位、还原会话模式，明确交代已完/未完并停。',
+  whenToUse: '用户说"停止/取消 ultrawork"、"别自动继续了"、"cancel"，需要中止当前自主执行循环。',
+  invocation: { modelInvocable: true, userInvocable: true },
+  source: 'runtime',
+  content: `# omo-cancel-ultrawork — 停止自主执行循环
+
+立即停止当前 ultrawork / 自主执行：
+
+1. 清 boulder 活跃计划水位：调用 \`omo_ultrawork\` 并传 \`cancel: true\`（清除 activePlan，杜绝后续 RESUME 自动续跑）。
+2. 还原会话模式：\`omo_session_model(state=off)\`（若处于规划态/执行态一并退出）。
+3. 向用户简要交代：已完成的 / 未完成的 / 可续接点；然后**停**，不再自动继续。`,
 }
 
 const SISYPHUS_RETURN: SkillRegistration = {
@@ -459,28 +483,48 @@ const ULW_PLAN: SkillRegistration = {
 ## 规划模式是粘性的
 用户说 "do X / fix X / build X / 直接做" 在本技能语境里都指"规划 X"。执行只发生在用户明确批准之后（如 start-work）。
 
-## 流程
-### 1. 意图裁决（一行公告）
-探索后判断并**向用户公告一行**：
-- **CLEAR**（终点与行为明确）："意图：CLEAR--我会只问代码库解决不了的分歧。"
-- **UNCLEAR**（"你看着办"类）："意图：UNCLEAR--我会先调研出最佳实践方案再规划。"
+## INTENT ROUTING（先裁决，一行公告）
 
-### 2. 探索落地（先查再问）
-- omo_code_search / omo_lsp / read 摸清：相关模块、既有约定、测试与构建命令。
-- omo_rules compile 的规则 + omo_note learnings / omo_memory compile 的历史结论--**先遵守，别重新发明**。
-- **只问探索解决不了的分歧**（架构选型/取舍/范围边界），一次问全（用 ask_user_question），不挤牙膏。
+### review_required 修饰词门（硬门，非风格暗示）
+用户在**任意轮次**说 "high accuracy" / "ultra high accuracy" / "deep review" / "고정밀" 或等价词——包括追加在追问里、甚至计划已存在之后：
+→ 草稿记 \`review_required: true\`，**momus + 独立 oracle 双评审 REQUIRED**（批准后必跑；计划已存在则当轮补跑）；"回答得更仔细"不算数。此门不影响 CLEAR/UNCLEAR 判定。
 
-### 3. 计划产出（decision-complete）
-写入 .omo/plans/<slug>.md，必须包含：
-- 目标与非目标（明确排除项）
-- 分解为波浪（每波：名称 / category / 任务 / 涉及文件 / 依赖）
-- 每个决策点给出**选定方案 + 理由**（不留"待定"）
-- 验证清单（交付前必须绿的具体命令）
-- 风险与回滚点
+### 意图裁决（公告一行：intent + review_required）
+探索落地后做**一个**判定并向用户公告一行（例："意图：CLEAR，无深度评审——只问真分歧" / "意图：UNCLEAR，已要求深度评审——研究到最佳实践后自动双评审"）：
+- **CLEAR**（终点与行为明确，只余偏好/取舍）：走 **CLEAR 路径**——只问代码库回答不了的真分歧。
+- **UNCLEAR**（终点本身模糊："你看着办"、bootstrap、无目标可述）：走 **UNCLEAR 路径**——研究最大化，不问用户。
+- **ON THE FENCE**：按 CLEAR 处理，只问一个澄清问题（宁可多问一个，不可静默替用户做决定）。
+- **显式要求访谈**（"ask me / interview me"）：CLEAR + 关闭默认采纳，所有取舍全问。
+
+## CLEAR 路径（只问真分歧，带 WHY）
+1. **拓扑锁定**（一轮内确认）：枚举 1-6 个可独立成败的顶层组件，记入草稿 Components 账本；禁止因"看起来小"塌缩为一个组件。
+2. **双过滤器**（每个候选问题依次过）：① 证据（repo/文档）能否回答 → 探索并引用，不问；② 意图 + 可辩护默认能否回答 → 采纳并记录，**除非是 owner-decision**（不可逆/破坏性/安全关键/跨切面产品选择，如公开配置面、分发打包、外部依赖或固定 SHA、数据/schema 形态）——owner-decision 永远问。
+3. **带 WHY 提问**：说明探索了什么、为何未决、答案分叉在哪；每轮 1-3 个窄问题，各带 2-4 选项且**推荐默认置顶**（跳过=取该默认）；每次确认测试策略（TDD / tests-after / none，agent 执行 QA 恒有）。
+4. **清场检查**（每轮后）：目标明确？范围 IN/OUT 明确？路线已决？测试策略已确认？无阻塞歧义？任一 NO=下一个问题；全 YES=出批准简报。
+
+## UNCLEAR 路径（研究最大化，禁止盘问）
+1. **主训令**：不得盘问用户——由研究消歧；用户时间只花在不可逆/破坏性/安全关键且研究无法解决的一个焦点问题上（只问一个）。
+2. **宽扇出研究**：并行 explorer/librarian 多路 + 更多轮，直到清场可答；每条代码库结论可溯源；子代理输出是声明，须独立核验。架构级/bootstrap：跑对抗工作流（collect→verify→design→adversarial→synthesize）。
+3. **默认采纳账本**：每个开放决策采纳行业最佳实践/repo 惯例默认，记入草稿 **Open-assumptions 账本**（理由 + 可逆性）；最终在计划人头 TL;DR 的 "Decisions I made for you" 块**响亮列出**，用户可在门禁处否决。
+4. **自动双评审**：人类没指挥 → 对抗评审替代被跳过的访谈：计划完成后**自动**跑 momus + oracle 双评审，不合格修后再送直到双 APPROVE（"要不要审"不问）；**Trivial 规模豁免**（模糊但微小的工作，如 "clean this up"：Momus 循环抑制，Metis 仍跑一次）。
+
+## 计划产出（8 头模板 + 每 todo 四件套）
+**写 \`.omo/plans/<slug>.md\` 必须按此结构**（人头 TL;DR 永远在顶）：
+1. \`## TL;DR (For humans)\`——一段话给人读（+ UNCLEAR 时附 "Decisions I made for you" 默认清单，供否决）
+2. \`## Scope\`——目标 + 明确 Non-goals（排除项），含 Must-Not-Have
+3. \`## Verification strategy\`——交付前必须绿的具体命令（可执行级）
+4. \`## Execution strategy\`——波浪分解（每波：名称 / category / 任务 / 涉及文件 / 依赖）
+5. \`## Todos\`——每个顶层 checkbox 任务带四件套：\`References\`（路径/行号出处）、\`Acceptance\`（可测判定）、\`QA\`（happy + failure 场景，agent 执行，精确工具 + 步骤 + 预期 + 证据路径）、\`Commit\`（怎么提交）
+6. \`## Final verification wave\`——F1-F4 级：合规 / 质量 / 真实人工 QA / 范围保真，各列验证者与判定
+7. \`## Commit strategy\`——提交分组方式（原子/信息风格）
+8. \`## Success criteria\`——整体完成判据
 同步用 omo_ultrawork 建计划并写 boulder activePlan 水位（供 start-work RESUME）。
 
-### 4. 等待批准
-展示计划 -> **停**。用户批准后才进入执行（start-work / ultrawork）。不批准不执行，不"先做一点点"。
+## Approval 状态机（持久草稿 = resume 点）
+1. 探索穷尽、分歧答完 → 在 \`.omo/drafts/<slug>.md\` 记录：\`intent\`、\`review_required\`、决策账本、\`status: awaiting-approval\`、待办动作（\`write .omo/plans/<slug>.md\`）。
+2. 展示简报一次 → **停，等用户显式 OK**。
+3. 用户的下一句按三类分流：**approve** → 落盘计划（review_required/UNCLEAR 先跑双评审再交付；CLEAR 无修饰词 → 问一句"直接开工 or 先双评审"，不替用户选）；**scope-change** → 更新草稿、回对应阶段；**still-unclear** → 继续研究，**不重探索已查过的**。
+4. 任何后续轮次：先读 draft 从记录字段续，不靠记忆重路由。**批准≠执行**——只授权写计划；ONE request → ONE plan。
 
 ## 会话模型（规划态）
 进入本技能时插件的规划态自动开启：当前会话模型切到 Prometheus 角色路由（delegate_roles.prometheus > categories.deep > heavy 档），

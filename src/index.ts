@@ -6,17 +6,23 @@
  * monitors, ultrawork conductor, handoff, team task table, layered config,
  * codegraph, lsp, model routing, planning-mode session switch, hooks
  * introspection, agent roster/briefs, context7 docs, look-at orchestrator,
- * dynamic SKILL.md loader), 17 runtime skills (ultrawork / start-work / ulw-plan
+ * dynamic SKILL.md loader), 18 runtime skills (ultrawork / start-work / ulw-plan
  * / rules / handoff / memory / model-routing / subagent-roles / deliver /
  * hyperplan / refactor / remove-ai-slops / debugging / review-work / init-deep
- * / git-master / sisyphus-return), and a JSON API for the client panel (/dsh-oh-my-agent/api/*).
+ * / git-master / sisyphus-return / cancel-ultrawork), and a JSON API for the
+ * client panel (/dsh-oh-my-agent/api/*).
  *
  * Session modes (Plugin source): /omo-ulw-plan → prometheus planning mode
  * (model = prometheus role route, write gate closed to plan artifacts);
  * /omo-start-work → atlas execution mode (model = atlas role route, atlas
  * discipline section injected, gate open); /omo-ultrawork → auto-exit planning
- * and /omo-sisyphus → return to default (revert, no agent switch).
+ * and /omo-sisyphus / /omo-cancel-ultrawork → return to default (revert, no
+ * agent switch); cancel also clears the boulder activePlan watermark.
  * Manual fallback tool: omo_session_model.
+ *
+ * Ultrawork Oracle verification gate: a completion claim (<promise>…</promise>,
+ * not VERIFIED) left in the session log is detected at pre-step and a mandatory
+ * independent Oracle verification notice is injected until VERIFIED clears it.
  *
  * Everything an agent-facing tool persists lands under `<workspace>/.omo/`
  * (the same state-dir convention OmO uses).
@@ -26,6 +32,7 @@ import type { Context } from '@deepseek-ai/cordis'
 // side-effect: pull in the webServer augmentation for the host runtime
 import '@deepseek-ai/dsh-host-webserver'
 import { defineTool, type ToolDefinition } from '@deepseek-ai/dsh-tools'
+import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import z from 'schemastery'
 
 import path from 'node:path'
@@ -33,7 +40,7 @@ import { readFile } from 'node:fs/promises'
 import { existsSync, readdirSync } from 'node:fs'
 import { text, PLUGIN_ID, ensureDir, resolveWorkspace, nowTs, omoDir, stripUndefined } from './util.js'
 import { scanRules, refreshRulesState } from './rules.js'
-import { boulderSummary, listNotes, appendNote, updateNote, newThreadBoulder, checkpointBoulder, isSection, SECTIONS, loadBoulder } from './boulder.js'
+import { boulderSummary, listNotes, appendNote, updateNote, newThreadBoulder, checkpointBoulder, isSection, SECTIONS, loadBoulder, saveBoulder } from './boulder.js'
 import { applyHashlineEdits, describeLines, type HashEdit } from './hashline.js'
 import { structuredSearch, astRewrite, astGrepScan } from './codeSearch.js'
 import { checkComments } from './commentCheck.js'
@@ -116,6 +123,43 @@ export function hasExecutablePlan(ws: string): boolean {
   } catch { /* ignore */ }
   return false
 }
+
+/* ── ultrawork Oracle 验证门（系统钩子）────────────────────────── */
+
+const PROMISE_CLAIM_RE = /<promise>((?!VERIFIED)[^<]*)<\/promise>/i
+
+/** 扫描会话事件尾部：是否存在未经验证的完成宣称 <promise>X</promise>（X≠VERIFIED）。 */
+export function hasUnverifiedUltraworkClaim(session: unknown): boolean {
+  try {
+    const events = (session as { events?: unknown[] } | undefined)?.events
+    if (!Array.isArray(events)) return false
+    let claimed = false
+    let verified = false
+    for (const ev of events) {
+      if (!ev || typeof ev !== 'object') continue
+      const e = ev as { type?: string; data?: AnyObj }
+      if (e.type !== 'assistant/message') continue
+      const blocks = Array.isArray((e.data?.message as AnyObj | undefined)?.content) ? (e.data!.message as AnyObj).content as unknown[] : []
+      for (const b of blocks) {
+        const blk = b as AnyObj
+        if (blk.type !== 'text' || typeof blk.text !== 'string') continue
+        if (/<promise>VERIFIED<\/promise>/i.test(blk.text)) verified = true
+        else if (PROMISE_CLAIM_RE.test(blk.text)) claimed = true
+      }
+    }
+    return claimed && !verified
+  } catch {
+    return false
+  }
+}
+
+/** 每会话每 claim 只提醒一次（claim 消解（VERIFIED）后复位）。 */
+const ultraworkGateNotified = new WeakMap<object, boolean>()
+
+const ULTRAWORK_GATE_NOTICE =
+  '[OMO GATE] 系统检测到未经验证的完成宣称 <promise>…</promise>——ultrawork 循环**不会结束**。' +
+  '立即执行：1) delegate_as(role=oracle, run_in_background=false) 独立验证（核对交付物/证据/验证输出，怀疑默认不完成）；' +
+  '2) 仅当 Oracle 验证通过后输出 <promise>VERIFIED</promise> 结束循环；不通过则修复后重送验证。'
 
 /** 会话默认模型 selection（agent-default-model 服务；不可用时 undefined）。 */
 function defaultsSelection(): ModelConfig | undefined {
@@ -681,11 +725,12 @@ function buildTools(config: Config): ToolDefinition[] {
   tools.push(
     tool(
       'omo_ultrawork',
-      'ultrawork 纪律协议指挥器（复刻 oh-my-openagent）：传入 goal(+可选 waves 波浪委托结构与 verification 验证清单)创建/更新计划；phase 推进 plan→explore→waves→verify→deliver，返回当前阶段 playbook。实际委托由你(代理)用原生子代理工具按 category 映射执行。',
+      'ultrawork 纪律协议指挥器（复刻 oh-my-openagent）：传入 goal(+可选 waves 波浪委托结构与 verification 验证清单)创建/更新计划；phase 推进 plan→explore→waves→verify→deliver，返回当前阶段 playbook；cancel=true 清 boulder activePlan 水位（停止续跑，配合 /omo-cancel-ultrawork）。实际委托由你(代理)用原生子代理工具按 category 映射执行。',
       {
         goal: { type: 'string' },
         phase: { type: 'string', enum: ['plan', 'explore', 'waves', 'verify', 'deliver'] },
         completed: { type: 'integer', description: '已完成的波浪数，用于 boulder RESUME 进度' },
+        cancel: { type: 'boolean', description: 'true=清 boulder activePlan 水位并停止续跑（无需其他参数）' },
         waves: {
           type: 'array',
           items: {
@@ -706,6 +751,7 @@ function buildTools(config: Config): ToolDefinition[] {
         type: 'object',
         additionalProperties: false,
         properties: {
+          ok: { type: 'boolean' },
           phase: { type: 'string' },
           plan: {
             type: 'object',
@@ -717,9 +763,19 @@ function buildTools(config: Config): ToolDefinition[] {
           message: { type: 'string' },
         },
       },
-      (_a, v) => text(String(v.markdown || '')),
+      (_a, v) => text(v.markdown ? String(v.markdown) : (v.message ? String(v.message) : '')),
       async (args, exec) => {
         const ws = wsFromExec(config, exec)
+        // cancel：清 boulder activePlan 水位，停止 RESUME 续跑
+        if (args.cancel === true) {
+          const b = loadBoulder(ws)
+          if (b.activePlan) {
+            delete (b as unknown as AnyObj).activePlan
+            saveBoulder(ws, b)
+            return { ok: true, message: 'ultrawork 已取消：boulder activePlan 水位已清除，后续不再自动续跑；可搭配 omo_session_model(state=off) 还原会话模式' }
+          }
+          return { ok: true, message: 'ultrawork 当前无活跃计划（无操作）' }
+        }
         const existing = readUltraPlan(ws)
         const phaseProp = (['plan', 'explore', 'waves', 'verify', 'deliver'] as const).find((p) => p === String(args.phase || '')) as UltraPhase | undefined
         if (typeof args.completed === 'number') recordWaveProgress(ws, Number(args.completed))
@@ -1893,6 +1949,37 @@ export function apply(ctx: Context, config: Config): void {
       try { if (typeof c === 'function') c() } catch { /* ignore */ }
     }
   }, 'dsh-oh-my-agent: session-mode switch')
+
+  // ultrawork Oracle 验证门：检测未经验证的 <promise> 完成宣称 → 注入强制验证提醒
+  ctx.effect(() => {
+    const anyCtx = ctx as unknown as { on: (ev: string, fn: unknown) => (() => void) | undefined }
+    const g = anyCtx.on('agent/pre-step', async (payload: unknown, next: unknown) => {
+      const decision = await (next as () => Promise<AnyObj>)()
+      try {
+        const agent = (payload as AnyObj | undefined)?.agent
+        const session = (agent as { session?: unknown } | undefined)?.session
+        if (!session || typeof session !== 'object') return decision
+        if (!hasUnverifiedUltraworkClaim(session)) {
+          ultraworkGateNotified.delete(session as object)
+          return decision
+        }
+        if (ultraworkGateNotified.get(session as object)) return decision // 同 claim 只提醒一次
+        ultraworkGateNotified.set(session as object, true)
+        const notice = createUserMessage({
+          content: [{ type: 'text', text: ULTRAWORK_GATE_NOTICE }],
+          source: { kind: 'plugin', plugin: PLUGIN_ID, form: 'notice', summary: 'ultrawork 完成宣称未验证——需 Oracle 验证' },
+        })
+        ctx.logger?.info?.('[dsh-oh-my-agent] ultrawork gate: unverified completion claim detected — notice injected')
+        return { ...decision, messages: [...(decision.messages as unknown[]), notice] }
+      } catch (e) {
+        ctx.logger?.warn?.(`[dsh-oh-my-agent] ultrawork gate error: ${String(e)}`)
+        return decision
+      }
+    })
+    return () => {
+      try { if (typeof g === 'function') g() } catch { /* ignore */ }
+    }
+  }, 'dsh-oh-my-agent: ultrawork oracle gate')
 
   // main-session system-prompt section (dsh-system-prompt channel).
   // Registered on the plugin's own long-lived fiber so the section persists;
