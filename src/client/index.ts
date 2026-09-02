@@ -10,7 +10,7 @@
  * createElement (no JSX), and every failure degrades to a quiet placeholder.
  */
 
-import { createElement, useEffect, useState } from 'react'
+import { createElement, useEffect, useRef, useState } from 'react'
 
 /** Local React type surface; react stays an external at runtime. */
 type ClientContext = {
@@ -33,6 +33,28 @@ interface OmOStatus {
   boulder?: { counts?: Record<string, number>; thread?: string }
   monitors?: Array<{ id: string; command: string; running: boolean; exitCode: number | null }>
   sections?: string[]
+}
+
+/** Host model-routes payload (mirrors src/index.ts apiModelRoutes). */
+interface ModelRoutesView {
+  ok?: boolean
+  ts?: string
+  roles?: Array<{
+    name: string
+    title: string
+    category: string
+    channel: string
+    tier: string
+    readOnly: boolean
+    resolution: { provider: string; model: string; source: string }
+  }>
+  categories?: Array<{ name: string; role: string; chosen: string; source: string; fallbackCount: number }>
+  available?: string[]
+  providers?: Array<{ provider: string; credentialEnv?: string; count: number; models: string[] }>
+  providerFailures?: string[]
+  roleOverrides?: Record<string, { value: string | null; file: string }>
+  categoryOverrides?: Record<string, { value: string | null; file: string }>
+  files?: Array<{ scope: string; path: string; existed: boolean }>
 }
 
 /** Tiny fetch wrapper with a timeout. */
@@ -69,6 +91,18 @@ export function OmOConsoleCard(_props: Record<string, unknown>): unknown {
   const [noteText, setNoteText] = useState('')
   const [noteSection, setNoteSection] = useState('learnings')
   const [noteMsg, setNoteMsg] = useState('')
+  const [modelRoutes, setModelRoutes] = useState<ModelRoutesView | null>(null)
+  const [routeEdits, setRouteEdits] = useState<Record<string, string>>({})
+  const [catEdits, setCatEdits] = useState<Record<string, string>>({})
+  const [routeScope, setRouteScope] = useState<'user' | 'workspace'>('user')
+  const [routeBusy, setRouteBusy] = useState(false)
+  const [routeMsg, setRouteMsg] = useState('')
+  const [routeError, setRouteError] = useState('')
+  /** 用户已动手编辑过（轮询刷新 metadata 时不得覆盖正在输入的 edits）。
+   * 用 ref 存——轮询闭包捕获的是初始 render 的 state，ref 保证读到最新值。 */
+  const [editsDirty, setEditsDirty] = useState(false)
+  const editsDirtyRef = useRef(false)
+  const markDirty = (): void => { editsDirtyRef.current = true; setEditsDirty(true) }
 
   const refresh = (): void => {
     setBusy(true)
@@ -103,6 +137,46 @@ export function OmOConsoleCard(_props: Record<string, unknown>): unknown {
       })
       .catch((e) => setError(String((e as Error)?.message ?? e)))
       .finally(() => setBusy(false))
+  }
+
+  /** 模型路由视图：可选「仅刷新 metadata（available/providers/settings）」不动编辑态。 */
+  const applyRoutesView = (v: ModelRoutesView, resetEdits: boolean): void => {
+    setModelRoutes(v)
+    if (!resetEdits && editsDirtyRef.current) return
+    const ro: Record<string, string> = {}
+    for (const [k, o] of Object.entries(v.roleOverrides ?? {})) ro[k] = o?.value ?? ''
+    const co: Record<string, string> = {}
+    for (const [k, o] of Object.entries(v.categoryOverrides ?? {})) co[k] = o?.value ?? ''
+    setRouteEdits(ro)
+    setCatEdits(co)
+  }
+
+  const loadRoutes = (resetEdits = true): void => {
+    apiGet('/dsh-oh-my-agent/api/modelroutes')
+      .then((r) => applyRoutesView(r as ModelRoutesView, resetEdits))
+      .catch((e) => setRouteError(String((e as Error)?.message ?? e)))
+  }
+  useEffect(() => {
+    loadRoutes()
+    const timer = setInterval(() => loadRoutes(false), 15000)
+    return () => clearInterval(timer)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  const onSaveRoutes = (): void => {
+    setRouteBusy(true)
+    setRouteError('')
+    apiPost('/dsh-oh-my-agent/api/modelroutes', { scope: routeScope, roles: routeEdits, categories: catEdits })
+      .then((r) => {
+        const rr = r as { ok?: boolean; message?: string }
+        setRouteMsg(String(rr.message ?? (rr.ok ? '已保存' : '保存失败')))
+        if (!rr.ok) setRouteError(String(rr.message ?? '保存失败'))
+        editsDirtyRef.current = false
+        setEditsDirty(false)
+        loadRoutes(true)
+      })
+      .catch((e) => setRouteError(String((e as Error)?.message ?? e)))
+      .finally(() => setRouteBusy(false))
   }
 
   const tools = status?.tools ?? []
@@ -155,6 +229,79 @@ export function OmOConsoleCard(_props: Record<string, unknown>): unknown {
     createElement('div', { style: { display: 'flex', gap: 8, alignItems: 'center', marginBottom: 10 } },
       createElement('button', { onClick: refresh, disabled: busy, style: btnSecondary }, busy ? '…' : '刷新'),
       createElement('button', { onClick: onScan, disabled: busy, style: btnSecondary }, '扫描规则重编译')),
+
+    // ── 子代理模型设置 ──
+    createElement('div', { style: { marginTop: 14, paddingTop: 12, borderTop: '1px solid var(--dsw-alias-border-l2)' } },
+      createElement('div', { style: { fontSize: 13, fontWeight: 700, color: 'var(--dsw-alias-label-primary)', marginBottom: 2 } }, '子代理模型路由'),
+      createElement('div', { style: { fontSize: 11, color: 'var(--dsw-alias-label-tertiary)', marginBottom: 8 } },
+        '设置页写入独立覆盖层（优先级最高），手写的 ~/.omo/omo.jsonc 保持不变'),
+      // 作用域 + 托管层状态
+      createElement('div', { style: { display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap', marginBottom: 8 } },
+        createElement('span', { style: { fontSize: 12, color: 'var(--dsw-alias-label-secondary)' } }, '写入作用域:'),
+        createElement(
+          'select',
+          {
+            value: routeScope,
+            onChange: (e: { target: { value: string } }) => { setRouteScope(e.target.value === 'workspace' ? 'workspace' : 'user'); loadRoutes() },
+            style: select,
+          },
+          createElement('option', { value: 'user' }, '用户层 ~/.omo/model-routes.jsonc'),
+          createElement('option', { value: 'workspace' }, '工作区 .omo/model-routes.jsonc'),
+        ),
+        createElement('span', { style: { fontSize: 11, color: 'var(--dsw-alias-label-tertiary)' } },
+          (modelRoutes?.files ?? []).map((f) => (f.scope === 'user' ? '用户层' : '工作区') + (f.existed ? '：已存在' : '：未创建')).join(' · '))),
+      // 候选模型说明：动态取自已注册 provider 的模型目录（配 provider 变化自动同步）
+      createElement('div', { style: { fontSize: 11, color: 'var(--dsw-alias-label-tertiary)', marginBottom: 6 } },
+        `候选模型动态取自已配置 provider 目录：${(modelRoutes?.providers ?? []).map((p) => `${p.provider}×${p.count}`).join(' · ') || '无'}${(modelRoutes?.providerFailures?.length ?? 0) ? '（部分 provider 查询失败: ' + modelRoutes!.providerFailures!.join('; ') + '）' : ''}`),
+      // 候选模型 datalist
+      createElement('datalist', { id: 'omo-route-suggest' },
+        (modelRoutes?.available ?? []).map((s) => createElement('option', { key: s, value: s }))),
+      // 角色路由行
+      createElement('div', { style: { marginBottom: 6 } },
+        createElement('div', { style: { fontSize: 12, fontWeight: 600, color: 'var(--dsw-alias-label-primary)', marginBottom: 4 } }, '角色路由（delegate_roles）'),
+        (modelRoutes?.roles ?? []).map((r) => {
+          const resolved = r.resolution?.provider ? `${r.resolution.provider}/${r.resolution.model}` : '—'
+          return createElement('div', { key: r.name, style: routeRow },
+            createElement('div', { style: { flex: 1, minWidth: 110 } },
+              createElement('div', { style: { fontSize: 12, color: 'var(--dsw-alias-label-primary)' } }, r.title),
+              createElement('div', { style: { fontSize: 11, color: 'var(--dsw-alias-label-tertiary)' } },
+                `${r.name} · ${r.resolution?.source ?? ''}`)),
+            createElement('span', { style: label }, r.category),
+            createElement('div', { style: { fontSize: 11, color: 'var(--dsw-alias-label-tertiary)', flex: 1, minWidth: 110 } },
+              `${resolved}${r.readOnly ? '（只读）' : ''}`),
+            createElement('input', {
+              list: 'omo-route-suggest',
+              value: routeEdits[r.name] ?? '',
+              placeholder: '自动（默认路由）',
+              onChange: (e: { target: { value: string } }) => { markDirty(); setRouteEdits({ ...routeEdits, [r.name]: e.target.value }) },
+              style: routeInput,
+            }),
+            createElement('button', { onClick: () => { markDirty(); setRouteEdits({ ...routeEdits, [r.name]: '' }) }, style: btnSecondary }, '清除'))
+        })),
+      // 分类决策层 <details>
+      createElement('details', { style: { marginBottom: 8 } },
+        createElement('summary', { style: { fontSize: 12, cursor: 'pointer' } }, '分类决策层（categories，收起）'),
+        createElement('div', { style: { marginTop: 4 } },
+          (modelRoutes?.categories ?? []).map((c) =>
+            createElement('div', { key: c.name, style: routeRow },
+              createElement('div', { style: { flex: 1, minWidth: 110 } },
+                createElement('div', { style: { fontSize: 12, color: 'var(--dsw-alias-label-primary)' } }, c.name),
+                createElement('div', { style: { fontSize: 11, color: 'var(--dsw-alias-label-tertiary)' } }, c.role)),
+              createElement('div', { style: { fontSize: 11, color: 'var(--dsw-alias-label-tertiary)', flex: 1, minWidth: 110 } },
+                `${c.chosen || '—'} · ${c.source}`),
+              createElement('input', {
+                list: 'omo-route-suggest',
+                value: catEdits[c.name] ?? '',
+                placeholder: '自动（默认路由）',
+                onChange: (e: { target: { value: string } }) => { markDirty(); setCatEdits({ ...catEdits, [c.name]: e.target.value }) },
+                style: routeInput,
+              }),
+              createElement('button', { onClick: () => { markDirty(); setCatEdits({ ...catEdits, [c.name]: '' }) }, style: btnSecondary }, '清除'))))),
+      // 保存
+      createElement('div', { style: { display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' } },
+        createElement('button', { onClick: onSaveRoutes, disabled: routeBusy, style: btnPrimary }, routeBusy ? '保存中…' : '保存覆盖'),
+        routeMsg ? createElement('div', { style: { fontSize: 11, color: 'var(--dsw-alias-state-success-primary)' } }, routeMsg) : null,
+        routeError ? createElement('div', { style: { fontSize: 11, color: 'var(--dsw-alias-state-error-primary)' } }, '保存失败: ' + routeError) : null)),
 
     // append note
     createElement('div', { style: { display: 'flex', gap: 6, alignItems: 'flex-start', flexWrap: 'wrap' } },
@@ -220,6 +367,22 @@ const select: Record<string, string | number> = {
   borderRadius: 8,
   padding: '6px 8px',
   fontSize: 12,
+}
+
+const routeRow: Record<string, string | number> = {
+  display: 'flex',
+  gap: 8,
+  alignItems: 'center',
+  flexWrap: 'wrap',
+  padding: '4px 0',
+  borderBottom: '1px solid var(--dsw-alias-border-l2)',
+}
+
+const routeInput: Record<string, string | number> = {
+  ...input,
+  flex: '0 1 220px',
+  minWidth: 150,
+  padding: '4px 8px',
 }
 
 /** Mount the console card. */

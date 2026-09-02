@@ -44,7 +44,7 @@ interface ChannelSpec {
 }
 
 /** AGENT_ROLES.dshTool → 通道规格。 */
-const CHANNEL_BY_DSH_TOOL: Record<string, ChannelSpec> = {
+export const CHANNEL_BY_DSH_TOOL: Record<string, ChannelSpec> = {
   subagent_default: { id: 'default', nativeTool: 'delegate_as(role=default)', tier: 'flash', readOnly: false },
   subagent_librarian: { id: 'librarian', nativeTool: 'delegate_as(role=librarian)', tier: 'flash', readOnly: true },
   subagent_review: { id: 'review', nativeTool: 'delegate_as(role=review)', tier: 'flash', readOnly: true },

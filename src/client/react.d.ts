@@ -16,4 +16,5 @@ declare module 'react' {
     deps: unknown[],
   ): T
   export function useEffect(fn: () => void | (() => void), deps?: unknown[]): void
+  export function useRef<T>(initial: T): { current: T }
 }

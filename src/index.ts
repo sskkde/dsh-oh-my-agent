@@ -46,9 +46,9 @@ import { structuredSearch, astRewrite, astGrepScan } from './codeSearch.js'
 import { checkComments } from './commentCheck.js'
 import { runCodegraph } from './codegraph.js'
 import { LspServerManager, serverAvailability } from './lsp.js'
-import { resolveCategory, routeLabel, type Category } from './modelRoute.js'
+import { resolveCategory, routeLabel, CATEGORIES, CATEGORY_ROLES, DEFAULT_CHAINS, type Category } from './modelRoute.js'
 import { AGENT_ROLES, findRole, buildBrief, buildTeamPlan } from './agents.js'
-import { resolveChannel, composeDelegationPrompt, getSubagentsService, runDelegation, resolveRoleRoute, DEFAULT_ROUTES, type DelegateRoutes } from './delegate.js'
+import { resolveChannel, composeDelegationPrompt, getSubagentsService, runDelegation, resolveRoleRoute, DEFAULT_ROUTES, CHANNEL_BY_DSH_TOOL, parseRoleRoute, type DelegateRoutes } from './delegate.js'
 import { docsSearch, docsGet } from './docs.js'
 import { lookAt, LOOK_INTENTS } from './lookAt.js'
 import { registerSkills, listRegistered } from './dynamicSkills.js'
@@ -63,7 +63,7 @@ import { skillRegistrations } from './skills.js'
 import { SISYPHUS_SECTION } from './sisyphusPrompt.js'
 import { PROMETHEUS_SECTION } from './prometheusPrompt.js'
 import { loadTasks, saveTasks, type TaskRow } from './teamTask.js'
-import { loadLayeredConfig, mergedTools, mergedToggle, loadUserConfig } from './omoconfig.js'
+import { loadLayeredConfig, mergedTools, mergedToggle, loadUserConfig, userRoutesFile, workspaceRoutesFile, readRoutesLayer, writeRoutesLayer, routesLayerExists } from './omoconfig.js'
 
 export const name = PLUGIN_ID
 // 'systemPrompt' is optional at runtime: hosts without dsh-system-prompt still
@@ -110,6 +110,9 @@ interface SysPromptCtx {
 let lastWs = ''
 /** Host ctx (set in apply) — delegate_as reads the subagents service lazily. */
 let hostCtx: unknown = null
+
+/** settings namespace 注册失败原因（module-level，供 settingsMirror 暴露）。 */
+let settingsNsError = ''
 
 /** 是否存在可执行计划：.omo/plans/ 下有计划文件，或 boulder 有 activePlan（start-work 切 Atlas 的前置条件）。 */
 export function hasExecutablePlan(ws: string): boolean {
@@ -1768,6 +1771,176 @@ function apiStatus(config: Config): AnyObj {
   }
 }
 
+const isPlainObj = (v: unknown): v is Record<string, unknown> =>
+  typeof v === 'object' && v !== null && !Array.isArray(v)
+
+/**
+ * 子代理模型路由视图（设置页数据源）：角色/分类三级解析、候选模型、
+ * 各层高优先级覆盖扫描与托管层文件状态。
+ */
+async function apiModelRoutes(config: Config): Promise<AnyObj> {
+  const ws = wsForConfig(config)
+  const view = loadLayeredConfig(ws)
+  const merged = view.merged
+  const routes: DelegateRoutes = { provider: config.delegateProvider, flash: config.delegateFlashRoute, heavy: config.delegateHeavyRoute }
+
+  // 每角色三级解析（delegate_roles > categories > tier 档位）；无派发通道的角色
+  // （sisyphus / multimodal-looker）展示其 category 决策层结论。
+  const roles = AGENT_ROLES.map((role) => {
+    const spec = CHANNEL_BY_DSH_TOOL[role.dshTool]
+    let resolution: { provider: string; model: string; source: string }
+    if (spec) {
+      resolution = resolveRoleRoute(role, spec, routes, merged)
+    } else {
+      const dec = resolveCategory({ category: role.category, mergedConfig: merged })
+      resolution = dec.chosen
+        ? { provider: dec.chosen.provider, model: dec.chosen.model, source: 'category(default)' }
+        : { provider: '', model: '', source: 'category(default)' }
+    }
+    return {
+      name: role.name,
+      title: role.title,
+      category: role.category,
+      channel: role.dshTool,
+      tier: spec?.tier ?? '',
+      readOnly: spec?.readOnly ?? false,
+      resolution,
+    }
+  })
+
+  // 分类决策层展示
+  const categories = CATEGORIES.map((cat) => {
+    const dec = resolveCategory({ category: cat, mergedConfig: merged })
+    return {
+      name: cat,
+      role: CATEGORY_ROLES[cat],
+      chosen: dec.chosen ? routeLabel(dec.chosen) : '',
+      source: dec.source,
+      fallbackCount: dec.chain.length,
+    }
+  })
+
+  // 候选模型：动态取自已注册 provider 的模型目录（llm.listProviders × listModels，
+  // 随 provider 配置变化实时刷新），再补档位/内置默认/配置中出现过的 'p/m' 串。
+  const seen = new Set<string>()
+  const pushModel = (s: string | undefined | null): void => {
+    if (s && s.includes('/') && !seen.has(s)) seen.add(s)
+  }
+  const providersView: AnyObj[] = []
+  const providerFailures: string[] = []
+  const llmGet = ((hostCtx as unknown as { get?: (k: string) => unknown }).get) ?? (() => undefined)
+  const llm = llmGet('llm') as { listProviders?: () => Array<AnyObj>; listModels?: (p: string) => Promise<Array<AnyObj>> } | undefined
+  if (llm && typeof llm.listProviders === 'function' && typeof llm.listModels === 'function') {
+    try {
+      const providers = llm.listProviders() ?? []
+      for (const p of providers) {
+        const id = String(p?.id ?? '')
+        if (!id) continue
+        try {
+          const models = await llm.listModels(id)
+          const entries = (models ?? []).map((m) => ({ provider: id, model: String(m?.id ?? '') })).filter((m) => m.model)
+          providersView.push({ provider: id, credentialEnv: p?.apiKeyEnv !== undefined ? String(p.apiKeyEnv) : undefined, count: entries.length, models: entries.map((m) => m.model) })
+          for (const m of entries) pushModel(`${m.provider}/${m.model}`)
+        } catch (e) {
+          providerFailures.push(`${id}: ${String(e)}`)
+        }
+      }
+    } catch (e) {
+      providerFailures.push(`llm.listProviders: ${String(e)}`)
+    }
+  } else {
+    providerFailures.push('llm 服务不可用（未装配 @deepseek-ai/dsh-llm）')
+  }
+  pushModel(config.delegateFlashRoute)
+  pushModel(config.delegateHeavyRoute)
+  pushModel(DEFAULT_ROUTES.flash)
+  pushModel(DEFAULT_ROUTES.heavy)
+  for (const chain of Object.values(DEFAULT_CHAINS)) {
+    for (const r of chain) pushModel(`${r.provider}/${r.model}`)
+  }
+  const scanSpec = (v: unknown): void => {
+    if (typeof v === 'string') { pushModel(v); return }
+    if (!isPlainObj(v)) return
+    if (typeof v.provider === 'string' && typeof v.model === 'string') { pushModel(`${v.provider}/${v.model}`); return }
+    scanSpec(v.model) // 设置页写入形态：categories[cat].model = { provider, model }
+  }
+  const oc = ((merged.opencode ?? merged['[opencode]']) ?? {}) as AnyObj
+  if (isPlainObj(oc.delegate_roles)) for (const v of Object.values(oc.delegate_roles)) scanSpec(v)
+  if (isPlainObj(oc.categories)) for (const v of Object.values(oc.categories)) scanSpec(v)
+  const score = (s: string): number => {
+    const low = s.toLowerCase()
+    if (low.includes('flash')) return 0
+    if (low.includes('deepseek') || low.includes('pro')) return 1
+    return 2
+  }
+  const available = [...seen].sort((a, b) => score(a) - score(b))
+
+  // 每 key 只记最高优先级来源：files 逆序扫描（后 push 者高）。
+  const ocOf = (p: unknown): AnyObj => {
+    if (!isPlainObj(p)) return {}
+    return ((p.opencode ?? p['[opencode]']) ?? {}) as AnyObj
+  }
+  const normalizeOverride = (raw: unknown): string | null => {
+    if (typeof raw === 'string') return raw.includes('/') ? raw : null
+    if (!isPlainObj(raw)) return null
+    if (typeof raw.provider === 'string' && typeof raw.model === 'string') return `${raw.provider}/${raw.model}`
+    return normalizeOverride(raw.model) // 设置页写入形态解析
+  }
+  const pickOverride = (key: string, bucketName: 'delegate_roles' | 'categories'): { value: string | null; file: string } | null => {
+    for (let i = view.files.length - 1; i >= 0; i -= 1) {
+      const src = view.files[i]
+      if (!src.existed) continue
+      const bucket = ocOf(src.parsed)[bucketName]
+      if (!isPlainObj(bucket)) continue
+      if (!(key in bucket)) continue
+      return { value: normalizeOverride(bucket[key]), file: src.path }
+    }
+    return null
+  }
+  const roleOverrides: AnyObj = {}
+  for (const role of AGENT_ROLES) {
+    const hit = pickOverride(role.name, 'delegate_roles')
+    if (hit) roleOverrides[role.name] = hit
+  }
+  const categoryOverrides: AnyObj = {}
+  for (const cat of CATEGORIES) {
+    const hit = pickOverride(cat, 'categories')
+    if (hit) categoryOverrides[cat] = hit
+  }
+
+  return {
+    ok: true,
+    ts: nowTs(),
+    roles,
+    categories,
+    available,
+    providers: providersView,
+    providerFailures,
+    roleOverrides,
+    categoryOverrides,
+    settings: settingsMirror(),
+    files: [
+      { scope: 'user', path: userRoutesFile(), existed: routesLayerExists(userRoutesFile()) },
+      { scope: 'workspace', path: workspaceRoutesFile(ws), existed: routesLayerExists(workspaceRoutesFile(ws)) },
+    ],
+  }
+}
+
+/** 探测 settings 服务镜像：设置页 tab 是否会把我们的卡片纳入渲染。 */
+function settingsMirror(): AnyObj {
+  const svcGet = ((hostCtx as unknown as { get?: (k: string) => unknown }).get) ?? (() => undefined)
+  const svc = svcGet('settings') as { describe?: (o: { redactSecrets?: boolean }) => Array<AnyObj> } | undefined
+  if (settingsNsError) return { available: true, served: [], registered: false, error: settingsNsError }
+  if (!svc || typeof svc.describe !== 'function') return { available: false, served: [], registered: false, error: settingsNsError || 'settings describe unavailable' }
+  try {
+    const desc = svc.describe({ redactSecrets: true })
+    const served = (desc ?? []).map((d) => String(d.ns ?? ''))
+    return { available: true, served, registered: served.includes('dsh-oh-my-agent') }
+  } catch (e) {
+    return { available: false, served: [], registered: false, error: String(e) }
+  }
+}
+
 /** Register a side effect whose disposer may be typed `unknown`. */
 function regOnce(ctx: Context, fn: () => unknown, tag: string): void {
   ctx.effect(() => {
@@ -1805,6 +1978,29 @@ export function apply(ctx: Context, config: Config): void {
   // skills
   for (const reg of skillRegistrations()) {
     regOnce(ctx, () => ((ctx as unknown as SkillsCtx).skills).register(reg), `dsh-oh-my-agent skill: ${reg.name}`)
+  }
+
+  // settings namespace 注册：设置页「插件配置」tab 只派发宿主 settings 服务已注册
+  // namespace 的卡片（ConfigurablePluginsTab 取 describe 镜像 ∩ slot entries）；
+  // 不注册则 key=dsh-oh-my-agent 的 settings.plugin.item 卡片永不渲染。
+  // schema 用宽松空对象——本卡片不消费 settings 值，只需 namespace 被 serve。
+  // 注册失败绝不拖垮 fiber：捕获并记录，供 settingsMirror() 暴露。
+  settingsNsError = ''
+  const svcGet = ((ctx as unknown as { get?: (k: string) => unknown }).get) ?? (() => undefined)
+  const settingsSvc = svcGet('settings') as { register?: (ns: string, schema: unknown, options?: unknown) => unknown } | undefined
+  if (settingsSvc && typeof settingsSvc.register === 'function') {
+    regOnce(ctx, () => {
+      try {
+        return settingsSvc.register!('dsh-oh-my-agent', z.object({}).loose(), { base: config })
+      } catch (e) {
+        // 双挂载（include + patch 两路 fiber）时第二实例会抛 already registered：
+        // 视为正常（namespace 已由另一实例持有，随该 fiber 生命周期管理）。
+        settingsNsError = /already registered/i.test(String(e)) ? '' : String(e)
+        return () => {}
+      }
+    }, 'dsh-oh-my-agent: settings namespace')
+  } else {
+    settingsNsError = 'settings service unavailable'
   }
 
   // webServer API (client panel data source)
@@ -1885,6 +2081,47 @@ export function apply(ctx: Context, config: Config): void {
         })
       }),
     }), 'dsh-oh-my-agent: api/note')
+
+    // 注意：webServer 的 exact 表只按 path 键（register 重路径即抛 duplicate，
+    // match 也只取 pathname），method 不参与路由。同路径 GET+POST 必须合并为
+    // 单一 handler，内部按 req.method 分发——否则第二条注册被 dup 容错降级成
+    // no-op，POST 会落到 GET 分支（只读视图、不写盘）。
+    regOnce(ctx, () => regRoute({
+      kind: 'exact',
+      path: '/dsh-oh-my-agent/api/modelroutes',
+      handler: ((req: { method?: string; on: (ev: string, cb: (chunk: string) => void) => void }, res: unknown) => {
+        if (String(req.method || 'GET').toUpperCase() !== 'POST') {
+          apiModelRoutes(config).then((v) => json(res, v)).catch((e) => json(res, { ok: false, message: String(e) }))
+          return
+        }
+        const ws = wsForConfig(config)
+        let body = ''
+        req.on('data', (chunk) => { body += String(chunk) })
+        req.on('end', () => {
+          try {
+            const parsed = JSON.parse(body || '{}') as { scope?: string; roles?: Record<string, string>; categories?: Record<string, string> }
+            const scope = parsed.scope === 'workspace' ? 'workspace' : 'user'
+            const roles = parsed.roles && typeof parsed.roles === 'object' ? parsed.roles : {}
+            const categories = parsed.categories && typeof parsed.categories === 'object' ? parsed.categories : {}
+            for (const name of Object.keys(roles)) {
+              if (!findRole(name)) { json(res, { ok: false, message: `unknown role "${name}"` }); return }
+            }
+            for (const name of Object.keys(categories)) {
+              if (!(CATEGORIES as readonly string[]).includes(name)) { json(res, { ok: false, message: `unknown category "${name}"` }); return }
+            }
+            for (const v of [...Object.values(roles), ...Object.values(categories)]) {
+              if (v && !parseRoleRoute(v)) { json(res, { ok: false, message: `invalid route "${String(v)}" (expected provider/model)` }); return }
+            }
+            const file = scope === 'workspace' ? workspaceRoutesFile(ws) : userRoutesFile()
+            const r = writeRoutesLayer(file, { roles, categories })
+            if (!r.ok) { json(res, { ok: false, message: r.message }); return }
+            apiModelRoutes(config).then((v) => json(res, { ok: true, file, message: r.message, view: v })).catch((e) => json(res, { ok: false, message: String(e) }))
+          } catch (e) {
+            json(res, { ok: false, message: String(e) })
+          }
+        })
+      }),
+    }), 'dsh-oh-my-agent: api/modelroutes')
   }
 
   // monitor cleanup on stop
