@@ -64,6 +64,7 @@ import { SISYPHUS_SECTION } from './sisyphusPrompt.js'
 import { PROMETHEUS_SECTION } from './prometheusPrompt.js'
 import { loadTasks, saveTasks, type TaskRow } from './teamTask.js'
 import { loadLayeredConfig, mergedTools, mergedToggle, loadUserConfig, userRoutesFile, workspaceRoutesFile, readRoutesLayer, writeRoutesLayer, routesLayerExists } from './omoconfig.js'
+import { GoalGuard, type GoalsServiceLike } from './goalGuard.js'
 
 export const name = PLUGIN_ID
 // 'systemPrompt' is optional at runtime: hosts without dsh-system-prompt still
@@ -80,6 +81,8 @@ export interface Config {
   mainPrompt: 'off' | 'sisyphus' | 'custom'
   /** Section text when mainPrompt=custom; ignored otherwise. */
   customPromptSection: string
+  /** goal-guard（方案 B）：派发后台子代理期间解除 goal 自动续跑，结算后自动恢复。 */
+  goalGuardOn: boolean
 }
 
 export const Config = z.object({
@@ -92,6 +95,8 @@ export const Config = z.object({
   // 主会话系统提示词附加段：默认注入 Sisyphus 编排纪律（见 src/sisyphusPrompt.ts）
   mainPrompt: z.union(['off', 'sisyphus', 'custom']).default('sisyphus'),
   customPromptSection: z.string().default(''),
+  // goal-guard：默认开启；关闭即退回 harness 原生行为（等待窗口仍会注入 goal 轮次）
+  goalGuardOn: z.boolean().default(true),
 })
 
 type AnyObj = Record<string, unknown>
@@ -110,6 +115,44 @@ interface SysPromptCtx {
 let lastWs = ''
 /** Host ctx (set in apply) — delegate_as reads the subagents service lazily. */
 let hostCtx: unknown = null
+
+// ── goal-guard（方案 B）模块级状态 ─────────────────────────────────────
+// 等待窗口内由插件在宿主服务层 disarm goal（模型工具层 pause/resume 需人类回合，
+// 救不了"派发子代理期间 idle 被 goal-round-driver 反复注入"）。全部子代理结算后
+// 自动 resume。见 src/goalGuard.ts。
+let goalGuard: GoalGuard | null = null
+let goalGuardLog: ((msg: string, warn?: boolean) => void) | null = null
+let goalGuardGoals: (() => GoalsServiceLike | undefined) | null = null
+/** 诊断计数器（api/goalguard 暴露；排查事件送达与决策卡点）。 */
+const goalGuardDiag = {
+  statusSeen: 0, statusIdleSeen: 0, goalChangeSeen: 0, idleRuns: 0,
+  agentsMissing: 0, subsMissing: 0, listFails: 0, running: -1, disarms: 0, resumes: 0,
+  dispatches: 0, dispatchAid: '', 
+  sessionEvents: 0, sessionTurnEnds: 0, sessionSettled: 0, sessionKinds: [] as string[],
+  last: '',
+}
+
+/** delegate_as 派发成功（continuable）后的守卫钩子：goal armed → 立即 disarm（等待窗口不注入）。 */
+function delegateGoalGuardDispatch(agent: unknown): void {
+  const guard = goalGuard
+  if (!guard) return
+  try {
+    const aid = String((agent as { id?: string } | undefined)?.id ?? '')
+    if (!aid) return
+    goalGuardDiag.dispatches += 1
+    goalGuardDiag.dispatchAid = aid
+    const svc = goalGuardGoals?.()
+    const goal = svc?.get(agent)
+    const mark = guard.dispatch(aid, goal)
+    if (mark) {
+      svc?.disarm(agent)
+      guard.recordDisarm(aid, mark)
+      goalGuardLog?.(`[goal-guard] disarmed goal ${mark.goalId}@${mark.revision}（等待窗口不注入）`)
+    }
+  } catch (e) {
+    goalGuardLog?.(`[goal-guard] dispatch hook failed: ${String(e)}`, true)
+  }
+}
 
 /** settings namespace 注册失败原因（module-level，供 settingsMirror 暴露）。 */
 let settingsNsError = ''
@@ -251,6 +294,7 @@ function buildTools(config: Config): ToolDefinition[] {
           counts: { type: 'object', additionalProperties: true },
           plan: { type: 'object', additionalProperties: true },
           monitors: { type: 'integer' },
+          goalGuard: { type: 'integer' },
         },
       },
       (_a, v) =>
@@ -260,7 +304,8 @@ function buildTools(config: Config): ToolDefinition[] {
             `- 工具: ${(v.tools as string[]).join(', ')}\n` +
             `- rules: ${String((v.rules as AnyObj)?.scanned)} scanned, ${String((v.rules as AnyObj)?.alwaysApply)} alwaysApply\n` +
             `- boulder: ${JSON.stringify(v.counts)}\n` +
-            `- monitors: ${String(v.monitors)}`,
+            `- monitors: ${String(v.monitors)}\n` +
+            `- goal-guard: ${String(v.goalGuard)} agents guarded`,
         ),
       async (_args, exec) => {
         const ws = wsFromExec(config, exec)
@@ -280,6 +325,7 @@ function buildTools(config: Config): ToolDefinition[] {
           counts: b.counts,
           ...(planWm ? { plan: { planId: planWm.planId, name: planWm.name, total: planWm.total, completed: planWm.completed, status: planWm.status } } : {}),
           monitors,
+          goalGuard: goalGuard?.guardedCount() ?? 0,
         }
       },
     ),
@@ -1489,6 +1535,7 @@ function buildTools(config: Config): ToolDefinition[] {
         }, args.run_in_background === false)
         if (outcome.mode === 'continuable') {
           if (outcome.error) return { ok: false, role: roleName, channel: spec.id, native_tool: spec.nativeTool, route: routeStr, read_only: spec.readOnly, note: outcome.error }
+          delegateGoalGuardDispatch(exec.agent)
           return { ok: true, role: roleName, channel: spec.id, native_tool: spec.nativeTool, route: routeStr, read_only: spec.readOnly, mode: 'continuable', subagentId: String(outcome.subagentId) }
         }
         // foreground：逐字段挂值，绝不携带 undefined（lossless JSON 拒绝）
@@ -2033,6 +2080,14 @@ export function apply(ctx: Context, config: Config): void {
 
     regOnce(ctx, () => regRoute({
       kind: 'exact',
+      path: '/dsh-oh-my-agent/api/goalguard',
+      handler: h((_req, res) => json(res, goalGuard
+        ? { ok: true, guarded: goalGuard.guardedCount(), states: goalGuard.snapshot(), diag: goalGuardDiag }
+        : { ok: true, guarded: 0, states: [], diag: goalGuardDiag })),
+    }), 'dsh-oh-my-agent: api/goalguard')
+
+    regOnce(ctx, () => regRoute({
+      kind: 'exact',
       path: '/dsh-oh-my-agent/api/scan',
       handler: h(async (_req, res) => {
         const ws = wsForConfig(config)
@@ -2146,6 +2201,227 @@ export function apply(ctx: Context, config: Config): void {
       try { if (typeof b === 'function') b() } catch { /* ignore */ }
     }
   }, 'dsh-oh-my-agent: hooks listeners')
+
+  // goal-guard（方案 B）：派发后台 continuable 子代理期间 disarm goal（进程内），
+  // 全部结算后自动 resume——消除等待窗口内 goal-round-driver 的反复 <goal_round>
+  // 注入（driver 只认 idle，不知道有未结算子代理）。见 src/goalGuard.ts。
+  if (config.goalGuardOn) {
+    const guard = new GoalGuard()
+    goalGuard = guard
+    ctx.effect(() => {
+      const anyCtx = ctx as unknown as {
+        on: (ev: string, fn: (...args: unknown[]) => unknown) => (() => void) | undefined
+        logger?: { info?: (m: string) => void; warn?: (m: string) => void }
+      }
+      const log = (msg: string, warn = false): void => {
+        try {
+          const l = anyCtx.logger
+          if (!l) return
+          if (warn) l.warn?.(`[dsh-oh-my-agent] ${msg}`)
+          else l.info?.(`[dsh-oh-my-agent] ${msg}`)
+        } catch { /* ignore */ }
+      }
+      const goalsSvc = (): GoalsServiceLike | undefined => {
+        try {
+          const svc = ((hostCtx as { get?: (k: string) => unknown } | null)?.get)?.('goals')
+          if (svc && typeof (svc as GoalsServiceLike).get === 'function' && typeof (svc as GoalsServiceLike).disarm === 'function' && typeof (svc as GoalsServiceLike).resume === 'function') {
+            return svc as GoalsServiceLike
+          }
+        } catch { /* ignore */ }
+        return undefined
+      }
+      const agentIdOf = (payload: unknown): string => String((payload as { agent?: { id?: string } } | undefined)?.agent?.id ?? '')
+      const disposers: Array<(() => void) | undefined> = []
+      const on = (ev: string, fn: (...args: unknown[]) => unknown): void => {
+        try {
+          const d = anyCtx.on(ev, fn)
+          if (typeof d === 'function') disposers.push(d)
+        } catch (e) {
+          log(`[goal-guard] listen ${ev} failed: ${String(e)}`, true)
+        }
+      }
+
+      goalGuardGoals = goalsSvc
+      goalGuardLog = log
+
+      // ── children 查询与共享决策执行器 ──────────────────────────────
+      // "是否有子代理在跑"用 subagents.listChildren（activity==='running' = 记录仍
+      // live 于 ctx.sessions，即工作未结束，含 send_message 冷恢复的 epoch2）。
+      // 不用 subagent/start|end 生命周期边：那是"驻留期终止"边且经作用域过滤，
+      // 外部监听器收不到（dsh-subagent 文档明言）。查询失败按"有子代理在跑"
+      // 保守处理（不自动 resume）。
+      const agentsSvc = (): { get: (id: string) => unknown } | undefined => {
+        try {
+          return ((hostCtx as { get?: (k: string) => unknown } | null)?.get)?.('agents') as { get: (id: string) => unknown } | undefined
+        } catch { /* ignore */ }
+        return undefined
+      }
+      const subagentsSvc = (): { listChildren: (parentSessionId: string) => Promise<Array<{ activity?: string }>> } | undefined => {
+        try {
+          const svc = ((hostCtx as { get?: (k: string) => unknown } | null)?.get)?.('subagents')
+          if (svc && typeof (svc as { listChildren?: unknown }).listChildren === 'function') {
+            return svc as { listChildren: (parentSessionId: string) => Promise<Array<{ activity?: string }>> }
+          }
+        } catch { /* ignore */ }
+        return undefined
+      }
+      const runningChildrenOf = async (agentId: string): Promise<number> => {
+        try {
+          const subs = subagentsSvc()
+          if (!subs) {
+            goalGuardDiag.subsMissing += 1
+            goalGuardDiag.last = `subagents svc missing (${agentId})`
+            return 1
+          }
+          const children = await subs.listChildren(agentId)
+          const running = children.filter((c) => c.activity === 'running').length
+          goalGuardDiag.running = running
+          return running
+        } catch (e) {
+          goalGuardDiag.listFails += 1
+          goalGuardDiag.last = `listChildren failed: ${String(e)}`
+          log(`[goal-guard] listChildren failed（按有子代理在跑保守处理）: ${String(e)}`, true)
+          return 1
+        }
+      }
+      const applyIdleDecision = async (agentId: string): Promise<void> => {
+        // 双挂载/热重载下效果闭包的 guard 可能与模块级不同步（旧 fiber 监听仍生效）：
+        // 一律在调用时重读模块级实例（最新 apply 者，与派发钩子/路由同一实例）。
+        const guard = goalGuard
+        if (!guard) return
+        goalGuardDiag.idleRuns += 1
+        try {
+          const svc = goalsSvc()
+          const agent = agentsSvc()?.get(agentId)
+          if (!agent) {
+            goalGuardDiag.agentsMissing += 1
+            goalGuardDiag.last = `agents.get(${agentId}) missing`
+            return
+          }
+          const goal = svc?.get(agent)
+          const running = await runningChildrenOf(agentId)
+          goalGuardDiag.last = `decide(${agentId}) running=${running} goal=${goal ? goal.phase + '/' + goal.activation : 'none'}`
+          const dec = guard.decideAtIdle(agentId, goal, running)
+          if (dec.kind === 'disarm') {
+            svc?.disarm(agent)
+            guard.recordDisarm(agentId, dec.mark)
+            goalGuardDiag.disarms += 1
+            log(`[goal-guard] waiting window: re-disarmed goal ${dec.mark.goalId}@${dec.mark.revision}（等待中设置/重新武装的 goal）`)
+          } else if (dec.kind === 'resume') {
+            try {
+              const view = svc?.resume(agent, { id: dec.mark.goalId, revision: dec.mark.revision })
+              guard.clearMark(agentId)
+              goalGuardDiag.resumes += 1
+              if (view) log(`[goal-guard] children settled: re-armed goal ${dec.mark.goalId}@${dec.mark.revision}（恢复自动续跑）`)
+            } catch (e) {
+              // resume 失败 = 保持 disarmed（fail-safe，交人类）；绝不让自动续跑借尸还魂
+              guard.clearMark(agentId)
+              goalGuardDiag.last = `resume failed: ${String(e)}`
+              log(`[goal-guard] resume failed (goal 保持 disarmed，需人类 resume): ${String(e)}`, true)
+            }
+          }
+        } catch (e) {
+          goalGuardDiag.last = `idle-decision threw: ${String(e)}`
+          log(`[goal-guard] idle-decision failed: ${String(e)}`, true)
+        }
+      }
+
+      // idle 决策：有 running 子代理 → 等待窗口（armed goal 再 disarm）；全空且
+      // mark 匹配且未毒化 → resume（恢复自动续跑）。
+      // （agent/status 已弃用：对根会话作用域过滤不可达；决策触发器见上：结算通知 /
+      // turn/end / goal/changed。）
+      // 等待中设置/goal 变更：有 running 子代理且 goal 被武装 → 立即 disarm，
+      // 堵住"设置 goal 后下一个 idle 被注入一轮"的竞态
+      on('goal/changed', (...args: unknown[]) => {
+        try {
+          goalGuardDiag.goalChangeSeen += 1
+          const guard = goalGuard
+          if (!guard) return
+          const raw = args.length > 1 ? args[args.length - 1] : args[0]
+          const aid = String((raw as { agent?: { id?: string } } | undefined)?.agent?.id ?? '')
+          if (!aid || !guard.has(aid)) return
+          void applyIdleDecision(aid)
+        } catch (e) {
+          log(`[goal-guard] goal/changed handler failed: ${String(e)}`, true)
+        }
+      })
+      // driver 的 fail-safe 信号 → 毒化：禁止自动 resume（不覆盖 harness 熔断）
+      on('agent/error', (payload: unknown) => {
+        try {
+          const guard = goalGuard
+          const aid = agentIdOf(payload)
+          if (guard && aid && guard.poison(aid, 'agent/error')) log(`[goal-guard] poisoned ${aid} (agent/error) — 不再自动 resume`)
+        } catch (e) {
+          log(`[goal-guard] agent/error handler failed: ${String(e)}`, true)
+        }
+      })
+      // ── 决策触发器（全部基于已验证可达的通道）──
+      // 实测：agent/status 对根 web 会话不可达（只有子代理 idle 到，被作用域过滤），
+      // session/event 与 goal/changed 可达。故：
+      //   - session/event user/message: subagent-settled（结算通知）→ 即时决策
+      //   - session/event turn/end（本会话正常结束）→ 决策兜底
+      //   - goal/changed（等待中设置/变更 goal）→ 有 running 子代理则即时 disarm
+      on('session/event', (session: unknown, event: unknown) => {
+        try {
+          const guard = goalGuard
+          const ev = event as { type?: string; data?: { reason?: { kind?: string }; source?: { kind?: string } } } | undefined
+          const t = String(ev?.type ?? '?')
+          if (goalGuardDiag.sessionKinds.length < 30 && !goalGuardDiag.sessionKinds.includes(t)) goalGuardDiag.sessionKinds.push(t)
+          goalGuardDiag.sessionEvents += 1
+          const sid = String((session as { id?: string } | undefined)?.id ?? '')
+          if (!guard || !guard.has(sid)) return
+          if (ev?.type === 'user/message' && ev.data?.source?.kind === 'subagent-settled') {
+            goalGuardDiag.sessionSettled += 1
+            goalGuardDiag.last = `settled-notice ${sid} → decide`
+            void applyIdleDecision(sid)
+            return
+          }
+          if (ev?.type === 'turn/end') {
+            goalGuardDiag.sessionTurnEnds += 1
+            const kind = ev.data?.reason?.kind
+            if (kind === 'max-tokens' || kind === 'aborted') {
+              if (guard.poison(sid, `turn/end:${kind}`)) log(`[goal-guard] poisoned ${sid} (${kind}) — 不再自动 resume`)
+              return
+            }
+            goalGuardDiag.last = `turn/end kind=${String(kind)} ${sid} → decide`
+            void applyIdleDecision(sid)
+          }
+        } catch (e) {
+          log(`[goal-guard] session/event handler failed: ${String(e)}`, true)
+        }
+      })
+      // 会话边界：整段状态作废（新 epoch 不继承等待窗口）
+      const dropOwner = (aid: string): void => {
+        goalGuard?.reset(aid)
+      }
+      on('agent/disposed', (payload: unknown) => {
+        try {
+          const aid = agentIdOf(payload)
+          if (aid) dropOwner(aid)
+        } catch (e) {
+          log(`[goal-guard] agent/disposed handler failed: ${String(e)}`, true)
+        }
+      })
+      on('agent/session-start', (payload: unknown) => {
+        try {
+          const aid = agentIdOf(payload)
+          if (aid) dropOwner(aid)
+        } catch (e) {
+          log(`[goal-guard] agent/session-start handler failed: ${String(e)}`, true)
+        }
+      })
+
+      ctx.logger?.info?.('[dsh-oh-my-agent] goal-guard 已启用（派发子代理期间 goal 不注入，结算后自动恢复）')
+      return () => {
+        for (const d of disposers) {
+          try { if (typeof d === 'function') d() } catch { /* ignore */ }
+        }
+        if (goalGuard === guard) goalGuard = null
+        if (goalGuardLog === log) goalGuardLog = null
+        if (goalGuardGoals === goalsSvc) goalGuardGoals = null
+      }
+    }, 'dsh-oh-my-agent: goal-guard (方案B)')
+  }
 
   // 会话级模式切换：skill 注入/调用路径 → pre-step 检测（prometheus 规划态 / atlas 执行态 / ultrawork 退态）
   ctx.effect(() => {
