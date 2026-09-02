@@ -54,6 +54,32 @@
 3. 编辑用 `omo_hashline_lines` 取行哈希 → `omo_hashline_edit` 做确定性精编。
 4. 干活过程 `omo_note` 记录经验；收尾 `omo_comment_check` + `omo_handoff`。
 
+## goal-guard（方案 B）：派发子代理期间的 goal 注入治理
+
+**问题**：DSH `goal-round-driver` 在 agent idle 且 goal `active+armed` 时必然排队下一轮
+`<goal_round>` 注入。dsh-omo 的委托纪律是“派发后台 continuable 子代理后结束回合、
+等结算通知”——等待窗口内 agent 处于 idle，armed goal 会被**反复注入**并烧光
+`maxGoalRounds`。模型工具层的 `pause/resume` 要求直接人类回合，模型自救不了。
+
+**对策**（插件在宿主服务层代为治理，无需人类介入）：
+
+- **派发** `delegate_as`（continuable）成功时：goal `active+armed` → `ctx.goals.disarm`
+  （进程内，无耐久事件、不改 phase/revision），记 mark（goalId/revision）。
+- **等待窗口**（`subagents.listChildren` 仍有 `activity:'running'` 子代理时）：
+  goal 若被重新武装（等待中才设置 goal / 人类手动 resume）→ 再次 disarm。
+- **结算**（`session/event` 的 `user/message source.kind='subagent-settled'` 通知，
+  或本会话 `turn/end`，或 `goal/changed`）：mark 未毒化、goal 仍 `active+disarmed` 且
+  id/revision 一致 → `ctx.goals.resume` 重新武装，恢复正常自主续跑。
+- **毒化**（fail-safe）：等待窗口内出现 driver 的故障信号（agent/error、
+  turn/end max-tokens/aborted）→ 禁止自动 resume，交给人类。
+
+**事件通道实测结论**：根会话的 `agent/status` 经作用域过滤**不可达**（只有子代理的
+idle 能到），`session/event` 与 `goal/changed` 可达——决策触发器只挂在已验证通道上。
+
+开关：omo.jsonc 或插件配置 `goalGuardOn: false` 关闭（默认开启）。
+观察：`GET /dsh-oh-my-agent/api/goalguard` 返回守卫状态快照 + diag 计数器：
+`omo_status` 输出 `goal-guard: N agents guarded`。
+
 ## 构建 / 注入
 
 ```bash
