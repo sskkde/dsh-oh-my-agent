@@ -147,7 +147,102 @@ export function loadLayeredConfig(ws: string): OmOConfigView {
   }
   for (const d of dirs) push(path.join(d, '.omo', 'omo.jsonc'))
 
+  // 设置页托管层（dsh-oh-my-agent「子代理模型设置」写入的 model-routes.jsonc）。
+  // 后 push 者优先，故本层压过一切手写 omo.jsonc——手写配置不被改写、设置页又必然生效。
+  push(userRoutesFile())
+  push(workspaceRoutesFile(ws))
+
   return { files: sources, merged, diagnostics, found: sources.some((s) => s.existed) }
+}
+
+const OMO_HOME = (): string => path.join(homedir(), '.omo')
+
+/** 设置页托管层文件：用户层 ~/.omo/model-routes.jsonc（本插件自管，勿手改）。 */
+export function userRoutesFile(): string {
+  return path.join(OMO_HOME(), 'model-routes.jsonc')
+}
+
+/** 设置页托管层文件：工作区 <ws>/.omo/model-routes.jsonc（本插件自管，勿手改）。 */
+export function workspaceRoutesFile(ws: string): string {
+  return path.join(ws, '.omo', 'model-routes.jsonc')
+}
+
+/**
+ * 读一个 model-routes 覆盖层；缺失或解析失败返回 null（不抛）。
+ * 结构：{ opencode: { delegate_roles?: Record<role, 'provider/model'>,
+ *        categories?: Record<category, { model?: {provider, model}, ... }> } }
+ */
+export function readRoutesLayer(file: string): Record<string, unknown> | null {
+  const raw = readFileOrNull(file)
+  if (raw === null) return null
+  try {
+    const parsed = parseJsonc(raw)
+    return isPlainObj(parsed) ? parsed : null
+  } catch {
+    return null
+  }
+}
+
+/**
+ * 写一个 model-routes 覆盖层（纯 JSON 输出，可往返解析）。patch 值 '' 表示删除该 key：
+ *  - roles:    delegate_roles[role] = 'provider/model'（非空）| delete（空）
+ *  - categories: categories[cat] 保留为普通对象（若已是），设 cat.model = {provider, model}；
+ *               空值 delete 该 category。
+ * 写文件前 mkdir -p dirname；失败返回 {ok:false, message}。
+ */
+export function writeRoutesLayer(
+  file: string,
+  patch: { roles: Record<string, string>; categories: Record<string, string> },
+): { ok: boolean; message: string } {
+  try {
+    const base: Record<string, unknown> = readRoutesLayer(file) ?? {}
+    if (!isPlainObj(base.opencode)) base.opencode = {}
+    const oc = base.opencode as Record<string, unknown>
+
+    let dr = oc.delegate_roles
+    if (!isPlainObj(dr)) { dr = {}; oc.delegate_roles = dr }
+    const drObj = dr as Record<string, unknown>
+    for (const [role, value] of Object.entries(patch.roles)) {
+      if (value) drObj[role] = value
+      else delete drObj[role]
+    }
+    if (Object.keys(drObj).length === 0) delete oc.delegate_roles
+
+    let cats = oc.categories
+    if (!isPlainObj(cats)) { cats = {}; oc.categories = cats }
+    const catsObj = cats as Record<string, unknown>
+    for (const [cat, value] of Object.entries(patch.categories)) {
+      if (value) {
+        const idx = value.indexOf('/')
+        const provider = idx > 0 ? value.slice(0, idx) : value
+        const model = idx > 0 ? value.slice(idx + 1) : ''
+        const prev = catsObj[cat]
+        const catObj = isPlainObj(prev) ? { ...(prev as Record<string, unknown>) } : {}
+        catObj.model = { provider, model }
+        catsObj[cat] = catObj
+      } else {
+        delete catsObj[cat]
+      }
+    }
+    if (Object.keys(catsObj).length === 0) delete oc.categories
+    if (Object.keys(oc).length === 0) delete base.opencode
+    if (Object.keys(base).length === 0) {
+      // 全部覆盖被清空：直接删除托管文件（不存在也不报错）
+      try { fs.rmSync(file, { force: true }) } catch { /* ignore */ }
+      return { ok: true, message: `removed ${file}` }
+    }
+
+    fs.mkdirSync(path.dirname(file), { recursive: true })
+    fs.writeFileSync(file, JSON.stringify(base, null, 2) + '\n', 'utf8')
+    return { ok: true, message: `wrote ${file}` }
+  } catch (e) {
+    return { ok: false, message: String(e) }
+  }
+}
+
+/** model-routes 覆盖层文件是否存在。 */
+export function routesLayerExists(file: string): boolean {
+  return readFileOrNull(file) !== null
 }
 
 /** Read the user-layer (~/.omo/omo.jsonc) merged config only (host-wide toggles). */
