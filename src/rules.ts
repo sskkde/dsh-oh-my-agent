@@ -173,15 +173,25 @@ export function scanRules(ws: string): RuleFile[] {
   return rules.filter((r) => (seen.has(r.file) ? false : (seen.add(r.file), true)))
 }
 
+/** 注入通道：file=按路径（edit 工具后置注入）、session=会话开始时注入一次、tool/user_prompt=预留。 */
+export type RuleChannel = 'file' | 'session' | 'tool' | 'user_prompt'
+
 /**
- * Find rules that apply to a given (workspace-relative, posix) target path.
- * Returns {always, matched} with alwaysApply rules and glob-matched rules.
+ * Find rules that apply to a given (workspace-relative, posix) target path on a
+ * given injection channel. Returns {always, matched} with alwaysApply rules and
+ * glob-matched rules.
+ *
+ * Channel gate: a rule only fires on channels it declares in `applyTo`
+ * (rules without applyTo default to ['file','session']). alwaysApply does NOT
+ * bypass the channel gate — otherwise a `[session, tool]` standing rule would
+ * still inject on every file edit.
  */
-export function rulesForPath(ws: string, relTarget: string): { rules: RuleFile[]; matched: RuleFile[]; always: RuleFile[] } {
+export function rulesForPath(ws: string, relTarget: string, channel: RuleChannel = 'file'): { rules: RuleFile[]; matched: RuleFile[]; always: RuleFile[] } {
   const all = scanRules(ws)
   const matched: RuleFile[] = []
   const always: RuleFile[] = []
   for (const r of all) {
+    if (!r.applyTo.includes(channel)) continue
     if (r.alwaysApply) {
       always.push(r)
       continue
@@ -197,6 +207,19 @@ export function rulesForPath(ws: string, relTarget: string): { rules: RuleFile[]
   return { rules: order, matched, always }
 }
 
+/**
+ * Standing rules for the `session` channel: alwaysApply rules that declare
+ * `applyTo` containing 'session' (e.g. a `[session, tool]` 铁律). Plain rules
+ * (default ['file','session']) are intentionally excluded — a session-start
+ * dump of every rule would duplicate the file-channel injections and spam the
+ * context.
+ */
+export function sessionRules(ws: string): RuleFile[] {
+  const out = scanRules(ws).filter((r) => r.alwaysApply && r.applyTo.includes('session'))
+  out.sort((a, b) => a.priority - b.priority)
+  return out
+}
+
 /** Compile a markdown block from matched rules (a "compiled rules" prompt section). */
 export function compileRules(rules: RuleFile[]): string {
   if (rules.length === 0) return ''
@@ -208,6 +231,7 @@ export function compileRules(rules: RuleFile[]): string {
     if (r.description) parts.push(`> ${r.description}`)
     if (r.globs.length) parts.push(`> applies to: ${r.globs.join(', ')}`)
     if (r.alwaysApply) parts.push(`> alwaysApply: true`)
+    if (r.applyTo.length) parts.push(`> channels: ${r.applyTo.join(', ')}`)
     parts.push('')
     parts.push(r.content)
   }
@@ -237,7 +261,7 @@ export function refreshRulesState(ws: string, targetRel?: string): {
   compiled: string
   compiledFile: string
 } {
-  const { rules, matched, always } = rulesForPath(ws, targetRel ?? '')
+  const { rules, matched, always } = rulesForPath(ws, targetRel ?? '', 'file')
   const compiled = compileRules(rules)
   const compiledFile = writeCompiledRules(ws, compiled)
   ensureDir(path.join(ws, OMO_DIR))

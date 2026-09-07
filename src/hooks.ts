@@ -13,8 +13,11 @@
  *       file for blocking markers. Modes (hooks.comment_checker): off | warn
  *       (default; attach a corrective context note) | block (hard-block the
  *       result toward the model).
- *   - rules-injector           : after edit/write, attach the compiled rules for
- *       the target path as additional context (deduped per path, TTL-cached).
+ *   - rules-injector           : after a successful `edit`, attach the compiled
+ *       rules for the target path as additional context (file channel; deduped
+ *       per path, TTL-cached). Standing `[session, tool]` rules are excluded by
+ *       the channel gate and instead injected once per session by the pre-step
+ *       listener in index.ts (session channel).
  *   - read-only planning gate  : agents whose preset is listed in
  *       hooks.read_only_agents may only write `*.md` inside `.omo/` (the
  *       Prometheus-style guard). The same gate also fires while the
@@ -36,6 +39,15 @@
  *       hashline-read-enhancer, adapted: DSH post-execute can only attach
  *       context, not rewrite the read output).
  *
+ * Beyond the cooperative waterfalls this module also exports one ToolGuard —
+ *   - nested-delegation-guard  : monotonic guard (registered via
+ *       `tools.guard`, evaluated after every pre-execute listener and before
+ *       the tool body) that denies delegation tools (`delegate_as`, host
+ *       named channels `subagent` / `subagent_*`) inside subagent sessions
+ *       (persistent `SessionHeader.origin === 'subagent'` or
+ *       `delegationDepth > 0`). Guards have no allow result, so no listener
+ *       ordering can undo the denial; the header fields survive cold resume.
+ *
  * Every listener is cooperative: it calls `next()` first so downstream deciders
  * (sandbox/approval) keep authority, and only appends/overrides per the model
  * above. All failures are contained — a throwing hook never breaks a tool call.
@@ -46,7 +58,7 @@ import path from 'node:path'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import { omoDir, nowTs, isWithin } from './util.js'
 import { loadLayeredConfig } from './omoconfig.js'
-import { refreshRulesState } from './rules.js'
+import { refreshRulesState, sessionRules, compileRules } from './rules.js'
 import { checkComments } from './commentCheck.js'
 import { MonitorRegistry } from './monitor.js'
 import { isPlanningActive } from './sessionModel.js'
@@ -95,6 +107,8 @@ export interface HooksConfig {
   jsonErrorRecovery: boolean
   monitorStatusInjector: boolean
   hashlineReadEnhancer: boolean
+  /** 子代理会话禁再派发（nested-delegation-guard ToolGuard）。 */
+  nestedDelegationGuard: boolean
   disabledHooks: string[]
 }
 
@@ -108,6 +122,7 @@ const DEFAULT_HOOKS: HooksConfig = {
   jsonErrorRecovery: true,
   monitorStatusInjector: true,
   hashlineReadEnhancer: true,
+  nestedDelegationGuard: true,
   disabledHooks: [],
 }
 
@@ -142,6 +157,7 @@ export function hooksConfigFor(ws: string, execWsHint?: string): HooksConfig {
   const jsonErrorRecovery = h.json_error_recovery === false ? false : DEFAULT_HOOKS.jsonErrorRecovery
   const monitorStatusInjector = h.monitor_status_injector === false ? false : DEFAULT_HOOKS.monitorStatusInjector
   const hashlineReadEnhancer = h.hashline_read_enhancer === false ? false : DEFAULT_HOOKS.hashlineReadEnhancer
+  const nestedDelegationGuard = h.nested_delegation_guard === false ? false : DEFAULT_HOOKS.nestedDelegationGuard
 
   return {
     writeGuard,
@@ -153,6 +169,7 @@ export function hooksConfigFor(ws: string, execWsHint?: string): HooksConfig {
     jsonErrorRecovery,
     monitorStatusInjector,
     hashlineReadEnhancer,
+    nestedDelegationGuard,
     disabledHooks: [...disabled],
   }
 }
@@ -161,10 +178,10 @@ const hookEnabled = (cfg: HooksConfig, name: string): boolean => !cfg.disabledHo
 
 /* ─────────────────────────── helpers ─────────────────────────── */
 
-interface ExecLike {
+export interface ExecLike {
   name: string
   arguments?: Record<string, unknown>
-  agent?: { session?: { header?: { cwd?: string; agentPreset?: string }; meta?: { cwd?: string; agentPreset?: string } } }
+  agent?: { session?: { header?: { cwd?: string; agentPreset?: string; origin?: string; delegationDepth?: number }; meta?: { cwd?: string; agentPreset?: string } } }
 }
 
 function wsOf(exec: ExecLike): string {
@@ -258,6 +275,27 @@ function compiledRulesFor(ws: string, targetRel: string): string {
   return block
 }
 
+/** Session-channel standing-rules block cache per workspace (5s TTL). */
+const sessionRulesCache = new Map<string, { at: number; block: string }>()
+
+/**
+ * Compiled block for the `session` channel: alwaysApply rules declaring
+ * `applyTo` containing 'session' (see rules.sessionRules). Injected once per
+ * session by the pre-step listener in index.ts — never by the file (edit) hook.
+ */
+export function sessionRulesBlockFor(ws: string): string {
+  const cached = sessionRulesCache.get(ws)
+  if (cached && Date.now() - cached.at < 5000) return cached.block
+  let block = ''
+  try {
+    block = compileRules(sessionRules(ws))
+  } catch {
+    block = ''
+  }
+  sessionRulesCache.set(ws, { at: Date.now(), block })
+  return block
+}
+
 /** Build a user-role context message for attachment. */
 function ctxMessage(text: string): unknown {
   return createUserMessage({
@@ -321,6 +359,45 @@ export async function omoPreExecute(
     // never break the pipeline on a hook failure
     try { pushLog('omo_pre_execute_error', String(exec.name ?? ''), '', 'error', String(e)) } catch { /* ignore */ }
     return next()
+  }
+}
+
+/* ─────────────────────────── nested-delegation guard ─────────────────────────── */
+
+/**
+ * 派发工具面：插件 `delegate_as` + 宿主具名通道 `subagent` / `subagent_*`
+ * （前缀匹配，不依赖部署名册——本部署是 subagent_default/deep/librarian/review/oracle）。
+ */
+export function isDelegationTool(name: string): boolean {
+  return name === 'delegate_as' || name === 'subagent' || name.startsWith('subagent_')
+}
+
+/** 会话是否子代理：持久 SessionHeader 判定（origin/delegationDepth 冷恢复依然成立）。 */
+function isSubagentSession(exec: ExecLike): boolean {
+  const header = exec.agent?.session?.header
+  if (!header) return false
+  if (header.origin === 'subagent') return true
+  return typeof header.delegationDepth === 'number' && header.delegationDepth > 0
+}
+
+/**
+ * ToolGuard（monotonic）：子代理会话里拒绝一切派发工具（嵌套派发），主会话不受影响。
+ * 注册为 plain-context 全局守卫——位于 pre-execute waterfall 之后、工具体之前，
+ * 无 allow 结果，任何监听器顺序都翻不了案；返回 string 即最终拒绝。
+ */
+export function nestedDelegationGuard(exec: ExecLike): string | undefined {
+  try {
+    const name = String(exec.name ?? '')
+    if (!isDelegationTool(name)) return undefined
+    if (!isSubagentSession(exec)) return undefined
+    const ws = wsOf(exec)
+    const cfg = hooksConfigFor(ws || (lastWsHint || process.cwd()), ws)
+    if (!cfg.nestedDelegationGuard || !hookEnabled(cfg, 'nested-delegation-guard')) return undefined
+    pushLog('nested-delegation-guard', name, '', 'deny', 'subagent session may not spawn subagents')
+    return '[omo_hooks] nested-delegation-guard: 子代理不能再派发子代理（嵌套委托已被宿主级守卫拒绝）。若任务需要分工或更多算力，把可并行的子任务连同所需上下文写进你的最终报告，由编排者统一派发；不要重试本调用。'
+  } catch {
+    // never break the pipeline on a guard failure
+    return undefined
   }
 }
 
@@ -401,7 +478,9 @@ export async function omoPostExecute(
       } catch { /* contained */ }
     }
 
-    // 4) rules-injector: attach compiled rules once per path
+    // 4) rules-injector: attach compiled rules once per path (file channel —
+    //    matched through rulesForPath(ws, fileRel, 'file'), so rules whose
+    //    applyTo excludes 'file' (e.g. [session, tool]) never fire here)
     if (hookEnabled(cfg, 'rules-injector') && cfg.rulesInjector && name === 'edit' && abs) {
       try {
         const block = compiledRulesFor(ws, fileRel ?? '')
