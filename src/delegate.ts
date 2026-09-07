@@ -13,8 +13,9 @@
  * 通道与档位镜像本部署 agent preset（cordis-delegate）的 tier 配置：
  *   flash = opencode-go/deepseek-v4-flash（default/librarian/review）
  *   heavy = volces/glm-5.3（deep/oracle）
- * 只读通道（librarian/review/oracle）经 request.toolFilter 硬禁 write/edit ——
- * 这是宿主级强制，不是提示词软纪律。
+ * 只读通道（librarian/review/oracle）经 request.toolFilter 硬禁 write/edit；
+ * denyTools 再叠加子代理会话内的派发工具禁用（嵌套派发防护，配套
+ * hooks.ts 的 nested-delegation-guard ToolGuard）——都是宿主级强制，不是提示词软纪律。
  */
 
 import { findRole, buildBrief, type AgentRole } from './agents.js'
@@ -129,6 +130,8 @@ export interface DelegationRequest {
   routes: DelegateRoutes
   /** 分层 omo.jsonc 合并结果（三级路由解析的第 1/2 级数据源；缺省时仅走档位默认）。 */
   merged?: Record<string, unknown>
+  /** 子代理会话内额外禁用的全局工具名（须为宿主已注册名——restrict 未知名响亮失败）。 */
+  denyTools?: string[]
 }
 
 export interface DelegationOutcome {
@@ -208,16 +211,18 @@ export function resolveRoleRoute(role: AgentRole, spec: ChannelSpec, routes: Del
   return { ...fallback, source: `tier:${spec.tier}` }
 }
 
-/** 组装 SubagentRequest（persona 系统层注入 + 只读通道硬禁写）。 */
+/** 组装 SubagentRequest（persona 系统层注入 + toolFilter 宿主级硬禁：只读通道禁写 + 子代理禁再派发）。 */
 export function buildSubagentRequest(req: DelegationRequest): Record<string, unknown> {
   const resolved = resolveRoleRoute(req.role, req.spec, req.routes, req.merged)
+  // 空过滤器会被宿主 restrict 响亮拒绝——仅在确有禁用项时携带
+  const deny = [...new Set([...(req.spec.readOnly ? ['write', 'edit'] : []), ...(req.denyTools ?? [])])]
   return {
     label: req.label,
     prompt: [{ type: 'text', text: req.prompt }],
     parent: req.parent,
     agentOptions: { provider: resolved.provider, model: resolved.model },
     persona: rolePersona(req.role),
-    ...(req.spec.readOnly ? { toolFilter: { deny: ['write', 'edit'] } } : {}),
+    ...(deny.length > 0 ? { toolFilter: { deny } } : {}),
   }
 }
 
