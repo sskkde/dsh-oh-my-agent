@@ -52,7 +52,7 @@ import { resolveChannel, composeDelegationPrompt, getSubagentsService, runDelega
 import { docsSearch, docsGet } from './docs.js'
 import { lookAt, LOOK_INTENTS } from './lookAt.js'
 import { registerSkills, listRegistered } from './dynamicSkills.js'
-import { omoPreExecute, omoPostExecute, hooksStatus, type HooksConfig } from './hooks.js'
+import { omoPreExecute, omoPostExecute, hooksStatus, nestedDelegationGuard, isDelegationTool, hooksConfigFor, sessionRulesBlockFor, type ExecLike, type HooksConfig } from './hooks.js'
 import { roleModelRoute, prometheusPlanRoute, sessionModeIntentOf, setSessionMode, sessionModeOf, type SessionMode, type ModelConfig } from './sessionModel.js'
 import { ATLAS_SECTION } from './atlasPrompt.js'
 import * as mem from './memory.js'
@@ -102,7 +102,7 @@ export const Config = z.object({
 type AnyObj = Record<string, unknown>
 
 /** Reachable host-service shapes (loose; plugin compiles against these). */
-interface ToolsCtx { tools: { register(d: unknown): unknown } }
+interface ToolsCtx { tools: { register(d: unknown): unknown; guard(g: (exec: ExecLike) => string | undefined): unknown } }
 interface SkillsCtx { skills: { register(d: unknown): unknown } }
 /** dsh-system-prompt service surface (loose; optional on the ctx). */
 interface SysPromptCtx {
@@ -1237,7 +1237,7 @@ function buildTools(config: Config): ToolDefinition[] {
   tools.push(
     tool(
       'omo_hooks',
-      '自动 hook 拦截层（复刻 oh-my-openagent Pre/PostToolUse 闸门，挂 DSH tools/pre-execute + post-execute）：write-existing-file-guard（覆盖已存在文件守卫）、comment-checker（写后自动扫阻断标记）、rules-injector（编辑时自动注入该路径的已编译规则）、read-only-gate（read_only_agents 名单只许写 .omo/ 下 md；Prometheus 规划态动态门，默认另放行 .agent-notes/，可经 plan_write_scopes 配置）、edit-error-recovery（编辑失败注入"停止-重读-验证"恢复指引，连续 2 次失败升级为换方法）、json-error-recovery（参数 JSON/schema 校验失败注入修正指引）、monitor-status-injector（运行中后台 monitor 状态变化时注入一行状态）、hashline-read-enhancer（首次 read 后提示行锚编辑可用）。开关经 omo.jsonc [opencode].hooks 与 disabled_hooks；status 显示生效配置与最近事件，log 看事件流。',
+      '自动 hook 拦截层（复刻 oh-my-openagent Pre/PostToolUse 闸门，挂 DSH tools/pre-execute + post-execute）：write-existing-file-guard（覆盖已存在文件守卫）、comment-checker（写后自动扫阻断标记）、rules-injector（编辑时自动注入该路径的已编译规则）、read-only-gate（read_only_agents 名单只许写 .omo/ 下 md；Prometheus 规划态动态门，默认另放行 .agent-notes/，可经 plan_write_scopes 配置）、edit-error-recovery（编辑失败注入"停止-重读-验证"恢复指引，连续 2 次失败升级为换方法）、json-error-recovery（参数 JSON/schema 校验失败注入修正指引）、monitor-status-injector（运行中后台 monitor 状态变化时注入一行状态）、hashline-read-enhancer（首次 read 后提示行锚编辑可用）、nested-delegation-guard（ToolGuard 单调守卫：子代理会话调用 delegate_as/subagent* 派发工具一律拒绝，杜绝嵌套派发；hooks.nested_delegation_guard=false 关闭）。开关经 omo.jsonc [opencode].hooks 与 disabled_hooks；status 显示生效配置与最近事件，log 看事件流。',
       {
         action: { type: 'string', enum: ['status', 'log'], required: true, default: 'status' },
         tail: { type: 'integer', description: 'log 返回条数' },
@@ -1519,6 +1519,9 @@ function buildTools(config: Config): ToolDefinition[] {
         const modelCfg = loadLayeredConfig(ws).merged
         const files = Array.isArray(args.files) ? (args.files as unknown[]).map(String) : []
         const routes: DelegateRoutes = { provider: config.delegateProvider, flash: config.delegateFlashRoute, heavy: config.delegateHeavyRoute }
+        // 子代理会话内禁再派发：只 deny 宿主实际已注册的插件派发工具（restrict 对未知名
+        // 响亮失败；宿主具名通道 subagent_* 非本插件注册，交由 nested-delegation-guard 兜底）
+        const denySpawn = registeredToolNames.filter(isDelegationTool)
         const spec = res.spec
         const resolved = resolveRoleRoute(res.role, spec, routes, modelCfg)
         const routeStr = `${resolved.provider}/${resolved.model}（${resolved.source}）`
@@ -1532,6 +1535,7 @@ function buildTools(config: Config): ToolDefinition[] {
           signal: exec.signal,
           routes,
           merged: modelCfg,
+          denyTools: denySpawn,
         }, args.run_in_background === false)
         if (outcome.mode === 'continuable') {
           if (outcome.error) return { ok: false, role: roleName, channel: spec.id, native_tool: spec.nativeTool, route: routeStr, read_only: spec.readOnly, note: outcome.error }
@@ -2195,12 +2199,18 @@ export function apply(ctx: Context, config: Config): void {
     const anyCtx = ctx as unknown as { on: (ev: string, fn: unknown) => (() => void) | undefined }
     const a = anyCtx.on('tools/pre-execute', omoPreExecute)
     const b = anyCtx.on('tools/post-execute', omoPostExecute)
-    ctx.logger?.info?.('[dsh-oh-my-agent] omo_hooks 监听器已挂载（write-guard / comment-checker / rules-injector / read-only-gate）')
+    ctx.logger?.info?.('[dsh-oh-my-agent] omo_hooks 监听器已挂载（write-guard / comment-checker / rules-injector / read-only-gate / nested-delegation-guard）')
     return () => {
       try { if (typeof a === 'function') a() } catch { /* ignore */ }
       try { if (typeof b === 'function') b() } catch { /* ignore */ }
     }
   }, 'dsh-oh-my-agent: hooks listeners')
+
+  // nested-delegation-guard：全局 ToolGuard（monotonic，pre-execute 之后、工具体之前）——
+  // 子代理会话（SessionHeader.origin/delegationDepth 持久判定）调用派发工具
+  // （delegate_as / 宿主具名通道 subagent、subagent_*）一律拒绝，主会话不受影响；
+  // 开关经 omo.jsonc hooks.nested_delegation_guard / disabled_hooks。
+  regOnce(ctx, () => ((ctx as unknown as ToolsCtx).tools).guard(nestedDelegationGuard), 'dsh-oh-my-agent: nested-delegation-guard')
 
   // goal-guard（方案 B）：派发后台 continuable 子代理期间 disarm goal（进程内），
   // 全部结算后自动 resume——消除等待窗口内 goal-round-driver 的反复 <goal_round>
@@ -2493,6 +2503,50 @@ export function apply(ctx: Context, config: Config): void {
       try { if (typeof g === 'function') g() } catch { /* ignore */ }
     }
   }, 'dsh-oh-my-agent: ultrawork oracle gate')
+
+  // rules session channel：会话第一步把「常设守则」（alwaysApply 且 applyTo 含
+  // 'session'，如 plugin-test-env.mdc 的 [session, tool] 铁律）注入一次。
+  // 与 file 通道（edit 按路径注入）互斥：通道门保证 [session, tool] 规则不再进
+  // edit 后置注入，只在本通道每会话出现一次（WeakSet 按 session 对象去重，
+  // 会话销毁自动回收；同一会话规则中途变更不重复注入）。
+  const sessionRulesNotified = new WeakSet<object>()
+  ctx.effect(() => {
+    const anyCtx = ctx as unknown as { on: (ev: string, fn: unknown) => (() => void) | undefined }
+    const g = anyCtx.on('agent/pre-step', async (payload: unknown, next: unknown) => {
+      const decision = await (next as () => Promise<AnyObj>)()
+      try {
+        const agent = (payload as AnyObj | undefined)?.agent as { session?: { header?: { cwd?: string }; meta?: { cwd?: string } } } | undefined
+        const session = (agent as { session?: unknown } | undefined)?.session
+        if (!session || typeof session !== 'object') return decision
+        const cwd = agent?.session?.header?.cwd ?? agent?.session?.meta?.cwd
+        if (!cwd) return decision
+        const ws = wsForConfig(config, cwd)
+        if (!ws) return decision
+        try {
+          const cfg = hooksConfigFor(ws)
+          if (!cfg.rulesInjector || cfg.disabledHooks.includes('rules-injector')) return decision
+        } catch {
+          return decision
+        }
+        if (sessionRulesNotified.has(session)) return decision
+        const block = sessionRulesBlockFor(ws)
+        if (!block || !block.trim()) return decision
+        sessionRulesNotified.add(session)
+        const notice = createUserMessage({
+          content: [{ type: 'text', text: `[OMO HOOK · rules · session] 会话常设守则（每次会话注入一次，请遵守）：\n${block.slice(0, 2500)}` }],
+          source: { kind: 'plugin', plugin: PLUGIN_ID, form: 'notice', summary: 'rules session 守则注入' },
+        })
+        ctx.logger?.info?.('[dsh-oh-my-agent] rules session channel: standing rules injected once for session')
+        return { ...decision, messages: [...(decision.messages as unknown[]), notice] }
+      } catch (e) {
+        ctx.logger?.warn?.(`[dsh-oh-my-agent] rules session channel error: ${String(e)}`)
+        return decision
+      }
+    })
+    return () => {
+      try { if (typeof g === 'function') g() } catch { /* ignore */ }
+    }
+  }, 'dsh-oh-my-agent: rules session channel')
 
   // main-session system-prompt section (dsh-system-prompt channel).
   // Registered on the plugin's own long-lived fiber so the section persists;

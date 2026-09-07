@@ -143,9 +143,16 @@ applyTo: [file, session, tool]
 Rule body...
 \`\`\`
 
+## Injection channels (applyTo)
+- \`file\`（默认含）— edit 工具按目标路径注入（rules-injector 后置挂点）。
+- \`session\` — 会话开始时注入一次（pre-step 监听；仅 alwaysApply 且 applyTo 含
+  \`session\` 的"常设守则"走此通道，避免普通规则双重刷屏）。
+- \`tool\` / \`user_prompt\` — 预留，尚无自动通道；不写 \`file\` 的规则在文件编辑
+  时不会注入（通道门对 alwaysApply 同样生效）。
+
 ## Usage
 - \`omo_rules\` action=scan → list every rule file found + parse status.
-- \`omo_rules\` action=path path=src/foo.ts → which rules apply to that file (globs matched).
+- \`omo_rules\` action=path path=src/foo.ts → which rules apply to that file (globs matched; file channel).
 - \`omo_rules\` action=compile → compile all matching rules into \`.omo/rules/compiled.md\`.
 - Precedence: user(\`~/.omo/rules\`) < workspace root < deeper dirs (deeper wins);
   alwaysApply rules are injected first.`,

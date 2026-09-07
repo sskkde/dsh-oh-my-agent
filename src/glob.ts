@@ -72,21 +72,23 @@ export function matchGlob(glob: string, relPath: string): boolean {
 }
 
 /**
- * Default matching semantics for a rule with a `globs` array: a rule applies
- * when ANY glob matches the target path. Negation globs are tested too but a
- * single positive hit wins; use ordering in the glob array for nuance.
+ * Default matching semantics for a rule with a `globs` array (aligns with the
+ * upstream rules-engine matcher): a rule applies when ANY positive glob
+ * matches the target path, unless a `!`-negated glob also matches (negation
+ * wins). An array of ONLY negation globs is a blacklist — applies to any path
+ * not matched by a negation. Empty/missing globs match everything (the
+ * rulesForPath layer handles that case before this call).
+ *
+ * NOTE: matchGlob itself already inverts `!`-prefixed patterns, so negation
+ * globs are evaluated here on their UNPREFIXED body (a body match = excluded).
  */
 export function matchAnyGlob(globs: string[], relPath: string): boolean {
   if (!globs || globs.length === 0) return true
-  let negated = false
-  for (const g of globs) {
-    const isNeg = g.startsWith('!')
-    const hit = matchGlob(g, relPath)
-    if (isNeg) {
-      if (hit) negated = true
-    } else if (hit) {
-      return true
-    }
-  }
-  return !negated
+  const positives: string[] = []
+  const negatives: string[] = []
+  for (const g of globs) (g.startsWith('!') ? negatives : positives).push(g)
+  const excluded = negatives.some((g) => matchGlob(g.slice(1), relPath))
+  if (positives.length === 0) return !excluded
+  if (excluded) return false
+  return positives.some((g) => matchGlob(g, relPath))
 }
