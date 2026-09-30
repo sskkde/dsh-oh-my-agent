@@ -54,6 +54,30 @@ function findAstGrep(): string | null {
   return whichSync('ast-grep')
 }
 
+/**
+ * Compose `cd <root> && <ast-grep argv>`.
+ *
+ * `--lang` must stay inside the SAME argv. An earlier version appended it as a
+ * separate array element joined with `&&`, so the shell ran `--lang` as its own
+ * command (`command not found`, exit 127): every language-scoped search/scan
+ * silently degraded to the text backend and language-scoped rewrite failed
+ * outright.
+ */
+function astGrepCmd(root: string, argv: string, lang?: string): string {
+  const full = lang ? `${argv} --lang ${shellQuote(lang)}` : argv
+  return `cd ${shellQuote(root)} && ${full}`
+}
+
+/**
+ * ast-grep follows grep exit-code semantics: 0 = matches, 1 = no match (with
+ * `--json` the stdout is `[]`), 2+ = usage/IO error. An unparseable pattern also
+ * surfaces as "no match", so exit 1 must never be reported to the caller as an
+ * invocation error.
+ */
+function isAstGrepFailure(code: number | null): boolean {
+  return code !== 0 && code !== 1
+}
+
 /** Plain text search (always available). */
 export function textSearch(
   ws: string,
@@ -114,35 +138,47 @@ export async function structuredSearch(
     return res
   }
   const root = opts.path ? path.resolve(ws, opts.path) : ws
-  // ast-grep output format: --format json with fields path, line, "text"
-  const cmd = [
-    `cd ${shellQuote(root)}`,
-    `${shellQuote(sg)} run --pattern ${shellQuote(pattern)} --json`,
-    opts.lang ? ` --lang ${shellQuote(opts.lang)}` : '',
-  ].filter(Boolean).join(' && ')
+  // ast-grep output format: --json with fields path, line, "text".
+  const cmd = astGrepCmd(root, `${shellQuote(sg)} run --pattern ${shellQuote(pattern)} --json`, opts.lang)
   const r = await runShell(cmd, { cwd: root, timeoutMs: 15000 })
-  if (!r.ok || !r.stdout.trim()) {
+  if (isAstGrepFailure(r.code)) {
+    const detail = r.stderr.trim().slice(0, 100)
     const fallback = textSearch(ws, pattern, { path: opts.path })
-    fallback.note = `ast-grep returned no/erroneous output (${r.stderr.slice(0, 120).trim() || 'no matches'}) — using text fallback.`
+    fallback.note = detail
+      ? `ast-grep invocation failed (exit ${r.code}: ${detail}) — using text fallback.`
+      : `ast-grep invocation failed (exit ${r.code}) — using text fallback.`
     return fallback
   }
   type AgRow = { path?: string; line?: number | string; col?: number | string; text?: string }
   let rows: AgRow[] = []
-  try {
-    const parsed = JSON.parse(r.stdout) as unknown
-    if (Array.isArray(parsed)) rows = parsed as AgRow[]
-    else if (parsed && typeof parsed === 'object') {
-      const obj = parsed as { matches?: unknown; items?: unknown }
-      rows = (Array.isArray(obj.matches) ? obj.matches : Array.isArray(obj.items) ? obj.items : []) as AgRow[]
+  if (r.stdout.trim()) {
+    try {
+      const parsed = JSON.parse(r.stdout) as unknown
+      if (Array.isArray(parsed)) rows = parsed as AgRow[]
+      else if (parsed && typeof parsed === 'object') {
+        const obj = parsed as { matches?: unknown; items?: unknown }
+        rows = (Array.isArray(obj.matches) ? obj.matches : Array.isArray(obj.items) ? obj.items : []) as AgRow[]
+      }
+    } catch {
+      const fallback = textSearch(ws, pattern, { path: opts.path })
+      fallback.note = 'ast-grep JSON parse failed — using text fallback.'
+      return fallback
     }
-  } catch {
-    const fallback = textSearch(ws, pattern, { path: opts.path })
-    fallback.note = 'ast-grep JSON parse failed — using text fallback.'
-    return fallback
   }
   const hits: SearchHit[] = rows
     .slice(0, 200)
     .map((row) => rowToHit(ws, root, row as Record<string, unknown>))
+  if (!hits.length) {
+    // No AST node matched (exit 1 / `[]`, or a structurally different pattern).
+    // Text search can still hit string/comment occurrences, so offer it — while
+    // reporting the real reason instead of calling a plain "no match" an error.
+    const fallback = textSearch(ws, pattern, { path: opts.path })
+    if (fallback.hits.length) {
+      fallback.note = 'ast-grep matched no AST node — served by text fallback (matches may live in strings/comments).'
+      return fallback
+    }
+    return { backend: 'ast-grep', query: pattern, hits: [], total: 0 }
+  }
   return { backend: 'ast-grep', query: pattern, hits, total: hits.length }
 }
 
@@ -164,14 +200,10 @@ export async function astGrepScan(
   const all: SearchHit[] = []
   const perPattern: Array<{ pattern: string; count: number }> = []
   for (const pat of patterns.slice(0, 12)) {
-    const cmd = [
-      `cd ${shellQuote(root)}`,
-      `${shellQuote(sg)} run --pattern ${shellQuote(pat)} --json`,
-      opts.lang ? ` --lang ${shellQuote(opts.lang)}` : '',
-    ].filter(Boolean).join(' && ')
+    const cmd = astGrepCmd(root, `${shellQuote(sg)} run --pattern ${shellQuote(pat)} --json`, opts.lang)
     const r = await runShell(cmd, { cwd: root, timeoutMs: 20000 })
     let count = 0
-    if (r.ok && r.stdout.trim()) {
+    if (!isAstGrepFailure(r.code) && r.stdout.trim()) {
       try {
         const parsed = JSON.parse(r.stdout) as unknown
         const rows = Array.isArray(parsed) ? parsed : []
@@ -214,13 +246,17 @@ export async function astRewrite(
     return snap
   }
   const before = snapshotFiles()
-  const cmd = [
-    `cd ${shellQuote(root)}`,
+  const cmd = astGrepCmd(
+    root,
     `${shellQuote(sg)} run --pattern ${shellQuote(pattern)} --rewrite ${shellQuote(replacement)} --update-all`,
-    opts.lang ? ` --lang ${shellQuote(opts.lang)}` : '',
-  ].filter(Boolean).join(' && ')
+    opts.lang,
+  )
   const r = await runShell(cmd, { cwd: root, timeoutMs: 30000 })
-  if (!r.ok) return { ok: false, backend: 'ast-grep', files: [], note: r.stderr.trim() || 'rewrite failed' }
+  // Exit 1 means the pattern matched nothing: "nothing to rewrite" is a
+  // successful no-op, not a failure.
+  if (isAstGrepFailure(r.code)) {
+    return { ok: false, backend: 'ast-grep', files: [], note: r.stderr.trim() || `rewrite failed (exit ${r.code})` }
+  }
   const changed = new Set<string>()
   for (const [f, st] of before) {
     try {
