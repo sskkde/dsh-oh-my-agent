@@ -1,14 +1,16 @@
 /**
  * nested-delegation-guard 单测（对编译产物 lib/hooks.js + lib/delegate.js 运行）：
  *   node test/delegationGuard.test.mjs
- * 覆盖：派发工具面匹配 / 子代理会话判定（origin、delegationDepth）/ 主会话放行 /
- * hooks 配置开关 / buildSubagentRequest 的 toolFilter 合并（只读禁写 + denyTools 去重）。
+ * 覆盖：派发工具面匹配（delegate_as / subagent / subagent_* / workflow / ralph + extra 逃生口）/
+ * 子代理会话判定（origin、delegationDepth）/ 主会话放行 / hooks 配置开关 /
+ * registerPerAgentGuard（agent.ctx.tools.guard 作用域注册助手，含防御与异常路径）/
+ * buildSubagentRequest 的 toolFilter 合并（只读禁写 + denyTools 去重）。
  */
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { nestedDelegationGuard, isDelegationTool } from '../lib/hooks.js'
+import { nestedDelegationGuard, isDelegationTool, registerPerAgentGuard } from '../lib/hooks.js'
 import { buildSubagentRequest } from '../lib/delegate.js'
 
 let passed = 0
@@ -37,10 +39,18 @@ const exec = (ws, name, header = {}) => ({ name, agent: { session: { header: { c
     assert.equal(isDelegationTool(ch), true)
   }
   assert.equal(isDelegationTool('subagents'), false) // 无下划线前缀不算
+  // 内部直调 spawn 的工具入口（绕过 ToolRuntime 的绕过面）
+  assert.equal(isDelegationTool('workflow'), true)
+  assert.equal(isDelegationTool('ralph'), true)
   for (const t of ['write', 'edit', 'omo_agents', 'send_message', 'list_agents', 'omo_hashline_edit']) {
     assert.equal(isDelegationTool(t), false)
   }
-  ok('派发工具面：delegate_as / subagent / subagent_* 命中，其余不误伤')
+  assert.equal(isDelegationTool('send_message'), false)
+  // filter 陷阱：index(number) 会被当第二参传入，Array.isArray 判断必须存在
+  let filterResult
+  assert.doesNotThrow(() => { filterResult = ['delegate_as', 'write'].filter(isDelegationTool) })
+  assert.deepEqual(filterResult, ['delegate_as'])
+  ok('派发工具面：delegate_as / subagent / subagent_* / workflow / ralph 命中，其余不误伤；filter 陷阱不炸')
 }
 
 // ── 2. 主会话（无 origin/depth）调用派发工具：放行 ──
@@ -116,6 +126,46 @@ const exec = (ws, name, header = {}) => ({ name, agent: { session: { header: { c
   const dup = buildSubagentRequest({ ...base, role, spec: specRW, denyTools: ['delegate_as', 'delegate_as'] })
   assert.deepEqual(dup.toolFilter, { deny: ['delegate_as'] })
   ok('buildSubagentRequest：toolFilter 合并/去重/空过滤器不携带')
+}
+
+// ── 8. workflow / ralph：内部直调 spawn 的工具入口，子代理会话一并封禁 ──
+{
+  const ws = tempWs(undefined)
+  for (const t of ['workflow', 'ralph']) {
+    assert.equal(typeof nestedDelegationGuard(exec(ws, t, { origin: 'subagent' })), 'string')
+    assert.equal(typeof nestedDelegationGuard(exec(ws, t, { delegationDepth: 1 })), 'string')
+    assert.equal(nestedDelegationGuard(exec(ws, t)), undefined)
+  }
+  ok('workflow / ralph：子代理会话（origin/depth）拒绝，无 header 主会话放行')
+}
+
+// ── 9. 逃生口：hooks.nested_delegation_extra_tools 追加封禁面 ──
+{
+  const ws = tempWs({ opencode: { hooks: { nested_delegation_extra_tools: ['browser_crawl'] } } })
+  assert.equal(typeof nestedDelegationGuard(exec(ws, 'browser_crawl', { origin: 'subagent' })), 'string')
+  assert.equal(typeof nestedDelegationGuard(exec(ws, 'browser_crawl', { delegationDepth: 1 })), 'string')
+  assert.equal(nestedDelegationGuard(exec(ws, 'browser_crawl')), undefined) // 主会话不受影响
+  assert.equal(nestedDelegationGuard(exec(ws, 'web_search', { origin: 'subagent' })), undefined) // 未列入的工具照常放行
+  const wsPlain = tempWs(undefined)
+  assert.equal(nestedDelegationGuard(exec(wsPlain, 'browser_crawl', { origin: 'subagent' })), undefined)
+  ok('extra 逃生口：配置后子代理调 browser_crawl 被拒，主会话与未配置时放行')
+}
+
+// ── 10. registerPerAgentGuard：agent.ctx.tools.guard 作用域注册助手 ──
+{
+  let captured
+  const fakeAgent = { ctx: { tools: { guard: (g) => { captured = g; return () => {} } } } }
+  const disposer = registerPerAgentGuard(fakeAgent)
+  assert.equal(typeof disposer, 'function')
+  assert.equal(captured, nestedDelegationGuard) // 注册的正是同一守卫函数
+
+  for (const bad of [{}, { ctx: {} }, { ctx: { tools: {} } }, undefined, null]) {
+    assert.equal(registerPerAgentGuard(bad), undefined)
+  }
+  // guard 抛错 / 返回非函数：一律 undefined，绝不向上抛
+  assert.equal(registerPerAgentGuard({ ctx: { tools: { guard: () => { throw new Error('boom') } } } }), undefined)
+  assert.equal(registerPerAgentGuard({ ctx: { tools: { guard: () => 42 } } }), undefined)
+  ok('registerPerAgentGuard：正常注册返回 disposer，缺 toolGuard/guard 抛错时返回 undefined')
 }
 
 for (const d of tempDirs) fs.rmSync(d, { recursive: true, force: true })
