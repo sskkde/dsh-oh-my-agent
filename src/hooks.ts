@@ -14,9 +14,11 @@
  *       (default; attach a corrective context note) | block (hard-block the
  *       result toward the model).
  *   - rules-injector           : after a successful `edit`, attach the compiled
- *       rules for the target path as additional context (file channel; deduped
- *       per path, TTL-cached). Standing `[session, tool]` rules are excluded by
- *       the channel gate and instead injected once per session by the pre-step
+ *       rules for the target path as additional context (file channel). Each
+ *       distinct block is delivered once per session; re-delivery happens only
+ *       when the rules themselves changed. The compiled set is TTL-cached per
+ *       (workspace, path). Standing `[session, tool]` rules are excluded by the
+ *       channel gate and instead injected once per session by the pre-step
  *       listener in index.ts (session channel).
  *   - read-only planning gate  : agents whose preset is listed in
  *       hooks.read_only_agents may only write `*.md` inside `.omo/` (the
@@ -56,7 +58,7 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
-import { omoDir, nowTs, isWithin } from './util.js'
+import { omoDir, nowTs, isWithin, sha256 } from './util.js'
 import { loadLayeredConfig } from './omoconfig.js'
 import { refreshRulesState, sessionRules, compileRules } from './rules.js'
 import { checkComments } from './commentCheck.js'
@@ -263,12 +265,79 @@ function buildEditRecovery(tool: string, fileRel: string | null, fails: number, 
 /** Recently-read paths (the write-guard "read-before-overwrite" ledger). */
 const recentReads = new Map<string, number>()
 
-/** Compiled-rules cache per workspace (5s TTL). */
+/** Compiled-rules cache per (workspace, target path) — 5s TTL. The target is
+ * part of the key on purpose: with a workspace-only key, the first edit of a
+ * 5s window handed its glob-matched rule set to every other path edited right
+ * after it (reproduced with a probe rule that only matched one file). */
 const rulesCache = new Map<string, { at: number; block: string }>()
 
+/** Size cap for the per-(workspace, path) rules cache (oldest evicted first). */
+const RULES_CACHE_MAX = 200
+
+/** Rules blocks recently delivered in a session. Two lookups decide whether the
+ * next delivery would add information:
+ *  - `lastGlobalHash` — the newest rules statement already in the transcript;
+ *    re-sending the identical block would say nothing new;
+ *  - `perPath` — the last block delivered for this edited path, i.e. whether
+ *    this path's rules changed since the model last saw them.
+ * A block is delivered only when BOTH say it is new. That keeps a batch of
+ * alternating per-path blocks quiet (a single "last block" pointer is defeated
+ * by every switch), while still re-delivering a genuine change (A → B → A
+ * included) and healing a copy that context compaction replaced, once
+ * RULES_REDELIVER_MS has passed.
+ *
+ * Session-scoped, so concurrent sessions never suppress each other. The
+ * "no session ⇒ no dedup" fallback is defensive only: this branch already
+ * requires a session-provided workspace, so a session object is always present
+ * (probed: agent missing / session without cwd → the hook emits nothing). */
+const RULES_REDELIVER_MS = 10 * 60_000
+/** Cap on the per-path ledger so a long session cannot grow it without bound. */
+const RULES_PATH_LEDGER_MAX = 64
+interface RulesDeliveryLedger {
+  lastGlobalHash: string
+  lastGlobalAt: number
+  perPath: Map<string, { hash: string; at: number }>
+}
+const rulesDeliveries = new WeakMap<object, RulesDeliveryLedger>()
+
+/** Decide and record one rules delivery for a session (see the ledger notes). */
+function rulesDeliveryIsNew(session: unknown, targetRel: string, hash: string): boolean {
+  if (!session || typeof session !== 'object') return true
+  const now = Date.now()
+  let led = rulesDeliveries.get(session)
+  if (!led) {
+    led = { lastGlobalHash: '', lastGlobalAt: 0, perPath: new Map() }
+    rulesDeliveries.set(session, led)
+  }
+  for (const [k, v] of led.perPath) if (now - v.at >= RULES_REDELIVER_MS) led.perPath.delete(k)
+  const pathEntry = led.perPath.get(targetRel)
+  const globalNew = led.lastGlobalHash !== hash || now - led.lastGlobalAt >= RULES_REDELIVER_MS
+  const pathNew = !pathEntry || pathEntry.hash !== hash || now - pathEntry.at >= RULES_REDELIVER_MS
+  if (!globalNew || !pathNew) return false
+  led.lastGlobalHash = hash
+  led.lastGlobalAt = now
+  led.perPath.delete(targetRel) // re-insert last so the cap evicts the oldest path
+  led.perPath.set(targetRel, { hash, at: now })
+  if (led.perPath.size > RULES_PATH_LEDGER_MAX) {
+    const oldest = led.perPath.keys().next().value
+    if (oldest !== undefined) led.perPath.delete(oldest)
+  }
+  return true
+}
+
 function compiledRulesFor(ws: string, targetRel: string): string {
-  const cached = rulesCache.get(ws)
-  if (cached && Date.now() - cached.at < 5000) return cached.block
+  const key = `${ws}::${targetRel}`
+  const now = Date.now()
+  const cached = rulesCache.get(key)
+  if (cached && now - cached.at < 5000) return cached.block
+  // The key is per (workspace, path), so without pruning this map would grow
+  // with every file ever edited in the process. Expired entries go first, then
+  // the cap drops the oldest survivors.
+  for (const [k, v] of rulesCache) if (now - v.at >= 5000) rulesCache.delete(k)
+  if (rulesCache.size >= RULES_CACHE_MAX) {
+    const oldest = [...rulesCache.entries()].sort((a, b) => a[1].at - b[1].at)
+    for (let i = 0; i <= oldest.length - RULES_CACHE_MAX; i++) rulesCache.delete(oldest[i][0])
+  }
   let state: ReturnType<typeof refreshRulesState> | null = null
   try {
     state = refreshRulesState(ws, targetRel)
@@ -276,7 +345,7 @@ function compiledRulesFor(ws: string, targetRel: string): string {
     state = null
   }
   const block = state?.compiled ?? ''
-  rulesCache.set(ws, { at: Date.now(), block })
+  rulesCache.set(key, { at: Date.now(), block })
   return block
 }
 
@@ -511,16 +580,25 @@ export async function omoPostExecute(
       } catch { /* contained */ }
     }
 
-    // 4) rules-injector: attach compiled rules once per path (file channel —
+    // 4) rules-injector: attach the compiled rules for this path (file channel —
     //    matched through rulesForPath(ws, fileRel, 'file'), so rules whose
-    //    applyTo excludes 'file' (e.g. [session, tool]) never fire here)
+    //    applyTo excludes 'file' (e.g. [session, tool]) never fire here).
+    //    Delivery is deduped per session against both the newest statement and
+    //    this path's previous block (see rulesDeliveryIsNew): an unchanged
+    //    repeat is suppressed, a changed block — A → B → A included — is
+    //    delivered, and the RULES_REDELIVER_MS window re-delivers after the
+    //    copy was compacted away. A change past the 2500-char cut is never
+    //    delivered either way.
     if (hookEnabled(cfg, 'rules-injector') && cfg.rulesInjector && name === 'edit' && abs) {
       try {
         const block = compiledRulesFor(ws, fileRel ?? '')
-        // Only inject when there is actual rule content ('' when no rules
+        // Only deliver when there is actual rule content ('' when no rules
         // matched); never fire for an empty shell.
         if (block && block.trim().length > 0) {
-          extra.push(ctxMessage(`[OMO HOOK · rules] 适用于 ${fileRel} 的已编译规则，请遵守：\n${block.slice(0, 2500)}`))
+          const delivered = block.slice(0, 2500)
+          if (rulesDeliveryIsNew(exec.agent?.session, fileRel ?? '', sha256(delivered))) {
+            extra.push(ctxMessage(`[OMO HOOK · rules] 适用于 ${fileRel} 的已编译规则，请遵守：\n${delivered}`))
+          }
         }
       } catch { /* contained */ }
     }
