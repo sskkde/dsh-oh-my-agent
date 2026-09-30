@@ -47,12 +47,12 @@
 | 自定义技能 SKILL.md（.opencode/skills） | `omo_skills`（扫描 .opencode/skills 与 .omo/skills 的 SKILL.md，frontmatter 解析，注册为 DSH 运行时技能） | ✅ |
 | 11-agent 多模型编排 / 原生团队 | 复用 DSH subagent_* / agent_teams / goal / ralph（角色职责见技能 `omo-subagent-roles`，选型见 `omo_model_route`，简报见 `omo_agents`） | 🔗 由 DSH 承担 |
 
-## 工具一览（21 个）
+## 工具一览（22 个）
 
 `omo_status` · `omo_rules` · `omo_note` · `omo_hashline_edit` · `omo_hashline_lines`
-`omo_code_search` · `omo_comment_check` · `omo_monitor` · `omo_ultrawork` · `omo_handoff` · `omo_team_task` · `omo_jsonc` · `omo_codegraph` · **`omo_lsp`** · **`omo_memory`** · **`omo_model_route`** · **`omo_hooks`** · **`omo_agents`** · **`omo_docs`** · **`omo_look_at`** · **`omo_skills`**
+`omo_code_search` · `omo_comment_check` · `omo_monitor` · `omo_ultrawork` · `omo_handoff` · `omo_team_task` · `omo_jsonc` · `omo_codegraph` · **`omo_lsp`** · **`omo_memory`** · **`omo_model_route`** · **`omo_session_model`** · **`omo_hooks`** · **`omo_agents`** · **`omo_docs`** · **`omo_look_at`** · **`omo_skills`**
 
-技能（16）：`omo-ultrawork` · `omo-start-work` · `omo-rules` · `omo-handoff` · `omo-memory` · `omo-model-routing` · `omo-subagent-roles` · `omo-deliver` · `omo-hyperplan` · `omo-refactor` · `omo-remove-ai-slops` · `omo-debugging` · `omo-review-work` · `omo-ulw-plan` · `omo-init-deep` · `omo-git-master`
+技能（18）：`omo-ultrawork` · `omo-start-work` · `omo-rules` · `omo-handoff` · `omo-cancel-ultrawork` · `omo-sisyphus` · `omo-memory` · `omo-model-routing` · `omo-subagent-roles` · `omo-deliver` · `omo-hyperplan` · `omo-refactor` · `omo-remove-ai-slops` · `omo-debugging` · `omo-review-work` · `omo-ulw-plan` · `omo-init-deep` · `omo-git-master`
 
 ## 快速上手
 
