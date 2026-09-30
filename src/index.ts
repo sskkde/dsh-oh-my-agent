@@ -55,6 +55,7 @@ import { registerSkills, listRegistered } from './dynamicSkills.js'
 import { omoPreExecute, omoPostExecute, hooksStatus, nestedDelegationGuard, registerPerAgentGuard, isDelegationTool, hooksConfigFor, sessionRulesBlockFor, type ExecLike, type HooksConfig } from './hooks.js'
 import { roleModelRoute, prometheusPlanRoute, sessionModeIntentOf, setSessionMode, sessionModeOf, type SessionMode, type ModelConfig } from './sessionModel.js'
 import { ATLAS_SECTION } from './atlasPrompt.js'
+import { OMO_MESSAGE_KIND } from './messageSource.js'
 import * as mem from './memory.js'
 import { MonitorRegistry } from './monitor.js'
 import { createUltraPlan, updateUltraPhase, ultraworkPhaseText, readUltraPlan, recordWaveProgress, type UltraPhase, type Wave } from './ultrawork.js'
@@ -2497,7 +2498,7 @@ export function apply(ctx: Context, config: Config): void {
         ultraworkGateNotified.set(session as object, true)
         const notice = createUserMessage({
           content: [{ type: 'text', text: ULTRAWORK_GATE_NOTICE }],
-          source: { kind: 'plugin', plugin: PLUGIN_ID, form: 'notice', summary: 'ultrawork 完成宣称未验证——需 Oracle 验证' },
+          source: { kind: OMO_MESSAGE_KIND, form: 'notice', summary: 'ultrawork 完成宣称未验证——需 Oracle 验证' },
         })
         ctx.logger?.info?.('[dsh-oh-my-agent] ultrawork gate: unverified completion claim detected — notice injected')
         return { ...decision, messages: [...(decision.messages as unknown[]), notice] }
@@ -2541,7 +2542,7 @@ export function apply(ctx: Context, config: Config): void {
         sessionRulesNotified.add(session)
         const notice = createUserMessage({
           content: [{ type: 'text', text: `[OMO HOOK · rules · session] 会话常设守则（每次会话注入一次，请遵守）：\n${block.slice(0, 2500)}` }],
-          source: { kind: 'plugin', plugin: PLUGIN_ID, form: 'notice', summary: 'rules session 守则注入' },
+          source: { kind: OMO_MESSAGE_KIND, form: 'notice', summary: 'rules session 守则注入' },
         })
         ctx.logger?.info?.('[dsh-oh-my-agent] rules session channel: standing rules injected once for session')
         return { ...decision, messages: [...(decision.messages as unknown[]), notice] }

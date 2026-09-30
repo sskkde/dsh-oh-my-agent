@@ -6,6 +6,12 @@
 > 而是把它的**旗舰功能**按 DSH 原生能力（子代理/团队/目标/技能/编辑）重新实现，所有持久状态落入
 > 会话工作区 `<workspace>/.omo/`（与 OmO 同名状态目录约定一致）。
 
+> **兼容性**：面向 DSH **0.1.7-rc.2**。0.1.7 取消了共享的 `'plugin'` 消息来源 kind，
+> 本插件按官方合并扩展约定（同 `agent-instructions` / `skill-invocation`）在
+> `src/messageSource.ts` 声明并使用自己的 `'oh-my-agent'` kind——只做 `MessageSourceMap`
+> 模块增强，属类型层声明，运行时无需注册（消费者对未知 kind 向下穿透）。
+> 客户端半体挂在 0.1.7 的 `settings.plugins.tab`（旧 `settings.plugin.item` 已移除）。
+
 ## 复刻的功能矩阵（原功能 → 本插件实现 → DSH 原生能力）
 
 | OmO 功能 | 本插件实现 | 状态 |
