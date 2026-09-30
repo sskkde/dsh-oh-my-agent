@@ -5,4 +5,6 @@ lib/
 # scratch: throwaway hook-test scripts + agent debug workspaces (not part of the package)
 /_*.mjs
 /.ag*-ws/
+# local scratch: plan drafts written by agent tooling (not part of the package)
+/.zcode/
 
