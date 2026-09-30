@@ -1,7 +1,7 @@
 /**
  * dsh-oh-my-agent — client half (OmO 控制台卡片).
  *
- * Registers a self-contained console card into the `settings.plugin.item`
+ * Registers a self-contained console card as a tab in the `settings.plugins.tab`
  * settings slot. The card polls the host API (/dsh-oh-my-agent/api/*) and
  * shows plugin health: registered tools, compiled rules, boulder memory,
  * background monitors — with refresh / scan-rules / append-note actions.
@@ -389,10 +389,11 @@ const routeInput: Record<string, string | number> = {
 export function apply(ctx: ClientContext): void {
   if (!ctx.slots) return
   ctx.effect(() => {
-    const disposer = ctx.slots.inject('settings.plugin.item', () => ctx.slots.register({
-      name: 'settings.plugin.item',
-      key: 'dsh-oh-my-agent',
+    const disposer = ctx.slots.inject('settings.plugins.tab', () => ctx.slots.register({
+      name: 'settings.plugins.tab',
+      id: 'dsh-oh-my-agent',
       order: 120,
+      label: () => 'OmO 控制台',
       inject: () => ({}),
     }, OmOConsoleCard))
     if (typeof disposer === 'function') return () => (disposer as () => void)()
