@@ -24,7 +24,7 @@
 | memory-core 持久记忆（markdown MemFS + frontmatter 契约 + 事务日志 + compile 注入） | `omo_memory`（create/put/read/str_replace/insert/delete/rename/update_description/compile/search/reflect/extract/journal）+ 技能 `omo-memory` | ✅ |
 | model-core category->fallback 链路由 | `omo_model_route`（resolve/list，omo.jsonc `categories.<name>` 覆盖链与 reasoning 归一化）+ 技能 `omo-model-routing` | ✅ |
 | Pre/PostToolUse 生命周期 hooks | `omo_hooks`（8 个：write-existing-file-guard / comment-checker / rules-injector / read-only-gate / **edit-error-recovery** / **json-error-recovery** / **monitor-status-injector** / **hashline-read-enhancer**，挂 DSH tools/pre-execute + post-execute；失败路径走恢复指引，成功路径走检查/注入） | ✅ |
-| 子代理禁再派发（防嵌套委托） | nested-delegation-guard：全局 ToolGuard（子代理会话调用 `delegate_as`/`subagent*` 一律拒绝，主会话不受影响）+ 委托时 `toolFilter` 使派发工具对子代理不可见；hooks.nested_delegation_guard=false 可关 | ✅ |
+| 子代理禁再派发（防嵌套委托） | nested-delegation-guard：全局 ToolGuard（子代理会话调用 `delegate_as`/`subagent*`/`workflow`/`ralph` 一律拒绝，含 `workflow.agent()`/`ralph` 内部直调 spawn 的绕过面，主会话不受影响）+ `agent/created` per-agent 作用域守卫纵深 + 委托时 `toolFilter` 使派发工具对子代理不可见；`hooks.nested_delegation_extra_tools` 逃生口、`hooks.nested_delegation_guard=false` 可关 | ✅ |
 | omo.jsonc 分层配置（用户层+项目层逐级覆盖，[opencode] 开关） | `omo_jsonc` + `disabled_tools`/`hashline_edit`/`monitor` 开关接线 | ✅ |
 | hyperplan 对抗式多智能体规划 | 技能 `omo-hyperplan` | ✅ |
 | /refactor 智能重构（结构搜索→小步→TDD） | 技能 `omo-refactor` + `omo_code_search`/`omo_hashline_edit` | ✅ |

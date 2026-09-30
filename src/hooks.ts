@@ -109,6 +109,8 @@ export interface HooksConfig {
   hashlineReadEnhancer: boolean
   /** 子代理会话禁再派发（nested-delegation-guard ToolGuard）。 */
   nestedDelegationGuard: boolean
+  /** 额外纳入派发面封禁的工具名，供未来新增 spawn 入口用逃生口。 */
+  nestedDelegationExtraTools: string[]
   disabledHooks: string[]
 }
 
@@ -123,6 +125,7 @@ const DEFAULT_HOOKS: HooksConfig = {
   monitorStatusInjector: true,
   hashlineReadEnhancer: true,
   nestedDelegationGuard: true,
+  nestedDelegationExtraTools: [],
   disabledHooks: [],
 }
 
@@ -158,6 +161,7 @@ export function hooksConfigFor(ws: string, execWsHint?: string): HooksConfig {
   const monitorStatusInjector = h.monitor_status_injector === false ? false : DEFAULT_HOOKS.monitorStatusInjector
   const hashlineReadEnhancer = h.hashline_read_enhancer === false ? false : DEFAULT_HOOKS.hashlineReadEnhancer
   const nestedDelegationGuard = h.nested_delegation_guard === false ? false : DEFAULT_HOOKS.nestedDelegationGuard
+  const nestedDelegationExtraTools = Array.isArray(h.nested_delegation_extra_tools) ? (h.nested_delegation_extra_tools as unknown[]).map(String).filter((s) => s.length > 0) : DEFAULT_HOOKS.nestedDelegationExtraTools
 
   return {
     writeGuard,
@@ -170,6 +174,7 @@ export function hooksConfigFor(ws: string, execWsHint?: string): HooksConfig {
     monitorStatusInjector,
     hashlineReadEnhancer,
     nestedDelegationGuard,
+    nestedDelegationExtraTools,
     disabledHooks: [...disabled],
   }
 }
@@ -366,10 +371,17 @@ export async function omoPreExecute(
 
 /**
  * 派发工具面：插件 `delegate_as` + 宿主具名通道 `subagent` / `subagent_*`
- * （前缀匹配，不依赖部署名册——本部署是 subagent_default/deep/librarian/review/oracle）。
+ * （前缀匹配，不依赖部署名册——本部署是 subagent_default/deep/librarian/review/oracle）
+ * + 内部直调 `subagents.start()` 的工具入口 `workflow` / `ralph`（它们本身是工具调用，
+ * 纳入即闭合"绕过 ToolRuntime 直接 spawn"的绕过面）。
+ * `extra` 为调用方额外纳入的工具名（hooks.nested_delegation_extra_tools 逃生口）。
  */
-export function isDelegationTool(name: string): boolean {
-  return name === 'delegate_as' || name === 'subagent' || name.startsWith('subagent_')
+const DELEGATION_TOOL_NAMES = new Set(['delegate_as', 'subagent', 'workflow', 'ralph'])
+export function isDelegationTool(name: string, extra?: readonly string[]): boolean {
+  if (DELEGATION_TOOL_NAMES.has(name)) return true
+  if (name.startsWith('subagent_')) return true
+  // Array.isArray 判断不可省：`Array.prototype.filter(isDelegationTool)` 会把 index(number) 当第二参传入。
+  return Array.isArray(extra) && extra.includes(name)
 }
 
 /** 会话是否子代理：持久 SessionHeader 判定（origin/delegationDepth 冷恢复依然成立）。 */
@@ -382,21 +394,42 @@ function isSubagentSession(exec: ExecLike): boolean {
 
 /**
  * ToolGuard（monotonic）：子代理会话里拒绝一切派发工具（嵌套派发），主会话不受影响。
+ * 覆盖 `delegate_as` / `subagent` / `subagent_*` / `workflow` / `ralph`，
+ * 另可经 `hooks.nested_delegation_extra_tools` 追加工具名逃生口。
+ * 判定顺序：子代理会话先筛（主会话零配置读取直接放行），再读配置。
  * 注册为 plain-context 全局守卫——位于 pre-execute waterfall 之后、工具体之前，
  * 无 allow 结果，任何监听器顺序都翻不了案；返回 string 即最终拒绝。
  */
 export function nestedDelegationGuard(exec: ExecLike): string | undefined {
   try {
     const name = String(exec.name ?? '')
-    if (!isDelegationTool(name)) return undefined
     if (!isSubagentSession(exec)) return undefined
     const ws = wsOf(exec)
     const cfg = hooksConfigFor(ws || (lastWsHint || process.cwd()), ws)
     if (!cfg.nestedDelegationGuard || !hookEnabled(cfg, 'nested-delegation-guard')) return undefined
+    if (!isDelegationTool(name, cfg.nestedDelegationExtraTools)) return undefined
     pushLog('nested-delegation-guard', name, '', 'deny', 'subagent session may not spawn subagents')
     return '[omo_hooks] nested-delegation-guard: 子代理不能再派发子代理（嵌套委托已被宿主级守卫拒绝）。若任务需要分工或更多算力，把可并行的子任务连同所需上下文写进你的最终报告，由编排者统一派发；不要重试本调用。'
   } catch {
     // never break the pipeline on a guard failure
+    return undefined
+  }
+}
+
+/**
+ * 档②纵深：把同一守卫注册到 agent 自己的 scope（`agent.ctx.tools.guard`）。
+ * 作用域守卫只对该 agent 生效，且随 agent ctx 销毁自动回收；
+ * 与全局守卫形成双保险，不依赖全局层的注册时序。
+ */
+export function registerPerAgentGuard(agent: unknown): (() => void) | undefined {
+  try {
+    const ctx = (agent as { ctx?: { tools?: { guard?: (g: unknown) => unknown } } } | null | undefined)?.ctx
+    const tools = ctx?.tools
+    if (tools === undefined || typeof tools.guard !== 'function') return undefined
+    // 必须以 `tools.guard(...)` 方法调用形式执行以保留 this（作用域视图）；不要解构后单独调用。
+    const disposer = tools.guard(nestedDelegationGuard)
+    return typeof disposer === 'function' ? (disposer as () => void) : undefined
+  } catch {
     return undefined
   }
 }
