@@ -15,5 +15,5 @@
     "types": [],
     "ignoreDeprecations": "6.0"
   },
-  "include": ["src/client/index.ts", "src/client/react.d.ts"]
+  "include": ["src/client/index.ts", "src/client/react.d.ts", "src/client/primitives.d.ts"]
 }

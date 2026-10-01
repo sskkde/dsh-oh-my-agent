@@ -11,6 +11,13 @@
  */
 
 import { createElement, useEffect, useRef, useState } from 'react'
+import {
+  IconAgentPresetOutlineRegular,
+  IconChevronDownOutlineRegular,
+  IconPlanOutlineRegular,
+  IconPlayOutlineRegular,
+  Menu,
+} from '@deepseek-ai/dsh-client-ui-primitives'
 
 /** Local React type surface; react stays an external at runtime. */
 type ClientContext = {
@@ -389,14 +396,66 @@ const routeInput: Record<string, string | number> = {
 }
 
 type SessionMode = 'off' | 'prometheus' | 'atlas'
+
+/** Composer control identity: each mode is labelled by the OmO role that owns it. */
+const SESSION_MODE_IDS: SessionMode[] = ['off', 'prometheus', 'atlas']
+const SESSION_MODE_ROLE: Record<SessionMode, { role: string; command: 'off' | 'plan' | 'exec'; hint: string }> = {
+  off: { role: 'Sisyphus', command: 'off', hint: '主编排（默认）：不切换模型，写门全开' },
+  prometheus: { role: 'Prometheus', command: 'plan', hint: '规划态：只读 + 计划工件，模型切规划路由' },
+  atlas: { role: 'Atlas', command: 'exec', hint: '执行态：按已批准计划编排波浪' },
+}
+const SESSION_MODE_GLYPH: Record<SessionMode, unknown> = {
+  off: createElement(IconAgentPresetOutlineRegular, {}),
+  prometheus: createElement(IconPlanOutlineRegular, {}),
+  atlas: createElement(IconPlayOutlineRegular, {}),
+}
+
+/**
+ * Trigger styles copied declaration-for-declaration from the native permission
+ * select's CSS module (`ui-permission-presets/PermissionSelect.module.css`), so
+ * the two controls that sit side by side share one visual language. Only the
+ * class prefix differs.
+ */
+const MODE_CSS = [
+  '.omoMode_trigger{border-radius:var(--dsw-radius-sm);min-width:0;max-width:220px;height:28px;color:var(--dsw-alias-label-secondary);cursor:pointer;background:0 0;border:none;outline:none;align-items:center;gap:4px;padding:0 4px 0 8px;font-size:13px;font-weight:500;line-height:20px;display:inline-flex}',
+  '.omoMode_trigger:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover)}',
+  '.omoMode_trigger:focus-visible{box-shadow:0 0 0 2px var(--dsw-focus-ring-color,var(--dsw-alias-state-business-primary))}',
+  '.omoMode_trigger:disabled{color:var(--dsw-alias-label-dimmed);cursor:default}',
+  '.omoMode_triggerIcon{flex:none;display:inline-flex}',
+  '.omoMode_triggerIcon svg{width:14px;height:14px}',
+  '.omoMode_triggerLabel{text-overflow:ellipsis;white-space:nowrap;min-width:0;overflow:hidden}',
+  '.omoMode_chevron{color:var(--dsw-alias-label-caption);flex:none;transition:transform .12s;display:inline-flex}',
+  '.omoMode_chevronOpen{transform:rotate(180deg)}',
+  '@container (width<=460px){.omoMode_trigger:has(.omoMode_triggerIcon) .omoMode_triggerLabel{display:none}}',
+].join('')
+const MODE_CSS_TAG = '@dsh-external/dsh-oh-my-agent/ModeSelect.module.css'
+
+/** Inject the trigger stylesheet once, mirroring how the native client does it. */
+function ensureModeStyles(): void {
+  if (typeof document === 'undefined') return
+  if (document.querySelector('style[data-plugin-css=' + JSON.stringify(MODE_CSS_TAG) + ']') !== null) return
+  const tag = document.createElement('style')
+  tag.dataset.plugin = '@dsh-external/dsh-oh-my-agent'
+  tag.dataset.pluginCss = MODE_CSS_TAG
+  tag.textContent = MODE_CSS
+  document.head.appendChild(tag)
+}
+ensureModeStyles()
+
 type ModeSelectProps = {
   sessionId?: string
   select?: (mode: 'off' | 'plan' | 'exec') => Promise<unknown>
   useProjection?: (key: string) => unknown
 }
 
-/** Compact composer mode selector; unavailable projection means read-only fallback. */
+/**
+ * Composer session-mode selector, styled and structured like the native
+ * permission select next to it (trigger + anchored `Menu` from ui-primitives).
+ * An unavailable projection degrades to a disabled label that writes nothing.
+ */
 export function ModeSelect(props: ModeSelectProps): unknown {
+  const [open, setOpen] = useState(false)
+  const [busy, setBusy] = useState(false)
   const [writeError, setWriteError] = useState('')
   const projectionHook = props.useProjection
   let projection: { mode?: SessionMode } | undefined
@@ -409,28 +468,54 @@ export function ModeSelect(props: ModeSelectProps): unknown {
     }
   }
   const mode = projection?.mode
-  const knownMode = mode === 'off' || mode === 'prometheus' || mode === 'atlas'
-  if (projectionFailed || !knownMode) {
-    return createElement('span', { style: { fontSize: 11, color: 'var(--dsw-alias-label-tertiary)' }, title: '会话模式投影不可用' }, '会话模式不可用')
+  if (projectionFailed || mode === undefined || SESSION_MODE_ROLE[mode] === undefined) {
+    return createElement('button', {
+      type: 'button',
+      className: 'omoMode_trigger',
+      disabled: true,
+      title: '会话模式投影不可用',
+    }, createElement('span', { className: 'omoMode_triggerLabel' }, '会话模式不可用'))
   }
 
-  const onChange = (event: { target: { value: string } }): void => {
-    const selected = event.target.value
-    if (!props.sessionId || !props.select || (selected !== 'off' && selected !== 'plan' && selected !== 'exec')) return
+  const current = SESSION_MODE_ROLE[mode]
+  const canWrite = Boolean(props.sessionId && props.select)
+  const choose = (id: string): void => {
+    setOpen(false)
+    const next = SESSION_MODE_ROLE[id as SessionMode]
+    if (!canWrite || next === undefined || id === mode) return
     setWriteError('')
-    void Promise.resolve().then(() => props.select!(selected)).catch((error: unknown) => {
-      setWriteError(String((error as Error)?.message ?? error))
-    })
+    setBusy(true)
+    void Promise.resolve()
+      .then(() => props.select!(next.command))
+      .catch((error: unknown) => { setWriteError(String((error as Error)?.message ?? error)) })
+      .then(() => { setBusy(false) })
   }
+  const items = SESSION_MODE_IDS.map((id) => ({ id, label: SESSION_MODE_ROLE[id].role, icon: SESSION_MODE_GLYPH[id] }))
+  const trigger = createElement('button', {
+    type: 'button',
+    className: 'omoMode_trigger',
+    'aria-label': '会话模式：' + current.role,
+    'aria-haspopup': 'menu',
+    'aria-expanded': open,
+    title: writeError !== '' ? writeError : current.hint,
+    disabled: !canWrite || busy,
+    onClick: () => { setOpen(!open) },
+  },
+    createElement('span', { className: 'omoMode_triggerIcon', 'aria-hidden': true }, SESSION_MODE_GLYPH[mode]),
+    createElement('span', { className: 'omoMode_triggerLabel' }, current.role),
+    createElement('span', { className: 'omoMode_chevron' + (open ? ' omoMode_chevronOpen' : ''), 'aria-hidden': true },
+      createElement(IconChevronDownOutlineRegular, {})))
 
-  const selectedMode = mode === 'prometheus' ? 'plan' : mode === 'atlas' ? 'exec' : 'off'
-  return createElement('label', { style: { display: 'inline-flex', alignItems: 'center', gap: 5 } },
-    createElement('span', { style: { fontSize: 11, color: 'var(--dsw-alias-label-secondary)' } }, '会话模式'),
-    createElement('select', { value: selectedMode, onChange, disabled: !props.sessionId || !props.select, style: select, title: writeError || undefined }, 
-      createElement('option', { value: 'off' }, 'off'),
-      createElement('option', { value: 'plan' }, '计划态'),
-      createElement('option', { value: 'exec' }, '执行态')),
-    writeError ? createElement('span', { role: 'status', style: { fontSize: 10, color: 'var(--dsw-alias-state-error-primary)' } }, '切换失败') : null)
+  return createElement(Menu, {
+    open,
+    items,
+    selectedId: mode,
+    onSelect: choose,
+    onClose: () => { setOpen(false) },
+    side: 'top',
+    portal: true,
+    anchor: trigger,
+  })
 }
 
 /** Mount the console card and composer mode selector. */
