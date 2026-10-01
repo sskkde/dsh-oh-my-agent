@@ -67,7 +67,7 @@ export const AGENT_ROLES: AgentRole[] = [
       '每个决策点给选定方案+理由，不留待定',
     ],
     stop: '产出 decision-complete 计划（执行者零追问）并等待批准',
-    evidence: '.omo/plans/<slug>.md + 决策清单',
+    evidence: '.omo/plans/<planId>.md + 决策清单',
   },
   {
     name: 'atlas',

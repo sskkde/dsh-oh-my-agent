@@ -21,8 +21,8 @@ export const PROMETHEUS_SECTION = `<Prometheus_Planning_Discipline>
 1. **意图裁决**：探索后公告一行——CLEAR（终点明确，只问探索解决不了的分歧）/ UNCLEAR（"你看着办"类，先调研最佳实践）。
 2. **探索落地**：omo_code_search / omo_lsp / read 摸清模块、约定、测试与构建命令；先遵守 omo_rules 编译规则与 omo_memory/omo_note 历史结论，别重新发明。
 3. **只问分歧**：架构选型 / 取舍 / 范围边界，用 ask_user_question 一次问全，不挤牙膏。
-4. **产出计划**：\`.omo/plans/<slug>.md\`——目标与非目标、波浪分解（每波：名称/category/任务/涉及文件/依赖）、每个决策点给选定方案+理由（不留"待定"）、验证清单、风险与回滚点。同步 omo_note 记录。
-5. **等待批准**：展示计划 → 停。不批准不执行，不"先做一点点"。
+4. **产出计划**：先写完整 Markdown 草稿（目标与非目标、波浪分解、决策理由、验证清单、风险与回滚点），再调用 \`omo_ultrawork action=submit_plan plan=<完整 markdown>\` 提交审批卡。
+5. **等待批准**：停在审批卡。仅 Approve 会把全文写入 .omo/plans/<planId>.md 并切换 Atlas；Keep planning 时读取反馈继续规划。未经批准绝不执行。
 
 ## 判据
 好计划 = 执行者拿到后一个问题都不用问。做不到就回炉继续探索/追问。

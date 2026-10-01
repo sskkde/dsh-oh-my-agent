@@ -516,7 +516,7 @@ const ULW_PLAN: SkillRegistration = {
 4. **自动双评审**：人类没指挥 → 对抗评审替代被跳过的访谈：计划完成后**自动**跑 momus + oracle 双评审，不合格修后再送直到双 APPROVE（"要不要审"不问）；**Trivial 规模豁免**（模糊但微小的工作，如 "clean this up"：Momus 循环抑制，Metis 仍跑一次）。
 
 ## 计划产出（8 头模板 + 每 todo 四件套）
-**写 \`.omo/plans/<slug>.md\` 必须按此结构**（人头 TL;DR 永远在顶）：
+**写 \`.omo/plans/<planId>.md\` 必须按此结构**（人头 TL;DR 永远在顶）：
 1. \`## TL;DR (For humans)\`——一段话给人读（+ UNCLEAR 时附 "Decisions I made for you" 默认清单，供否决）
 2. \`## Scope\`——目标 + 明确 Non-goals（排除项），含 Must-Not-Have
 3. \`## Verification strategy\`——交付前必须绿的具体命令（可执行级）
@@ -528,9 +528,9 @@ const ULW_PLAN: SkillRegistration = {
 同步用 omo_ultrawork 建计划并写 boulder activePlan 水位（供 start-work RESUME）。
 
 ## Approval 状态机（持久草稿 = resume 点）
-1. 探索穷尽、分歧答完 → 在 \`.omo/drafts/<slug>.md\` 记录：\`intent\`、\`review_required\`、决策账本、\`status: awaiting-approval\`、待办动作（\`write .omo/plans/<slug>.md\`）。
-2. 展示简报一次 → **停，等用户显式 OK**。
-3. 用户的下一句按三类分流：**approve** → 落盘计划（review_required/UNCLEAR 先跑双评审再交付；CLEAR 无修饰词 → 问一句"直接开工 or 先双评审"，不替用户选）；**scope-change** → 更新草稿、回对应阶段；**still-unclear** → 继续研究，**不重探索已查过的**。
+1. 探索穷尽、分歧答完 → 在 \`.omo/drafts/<slug>.md\` 记录：\`intent\`、\`review_required\`、决策账本、\`status: awaiting-approval\`、待办动作（\`write .omo/plans/<planId>.md\`）。
+2. 调用 \`omo_ultrawork action=submit_plan plan=<完整 markdown>\` 提交审批卡 → **停，等用户选择 Approve 或 Keep planning**。Approve 会落盘完整计划并切到 Atlas；Keep planning 的反馈必须处理后再重新提交。
+3. 审批卡选择 **Approve** 表示授权落盘并切到 Atlas；**Keep planning** 的自定义反馈作为 throw 内容处理，修订计划后再次提交。范围变化则更新草稿并回对应阶段；仍有不清楚处继续研究，不重探索已查过的。
 4. 任何后续轮次：先读 draft 从记录字段续，不靠记忆重路由。**批准≠执行**——只授权写计划；ONE request → ONE plan。
 
 ## 会话模型（规划态）
