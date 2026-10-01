@@ -35,7 +35,7 @@
 | hyperplan 对抗式多智能体规划 | 技能 `omo-hyperplan` | ✅ |
 | /refactor 智能重构（结构搜索→小步→TDD） | 技能 `omo-refactor` + `omo_code_search`/`omo_hashline_edit` | ✅ |
 | remove-ai-slops 清 AI 代码异味 | 技能 `omo-remove-ai-slops` | ✅ |
-| Prometheus 访谈规划 → Atlas 执行 | 技能 `omo-start-work`；纯规划变体（意图裁决 + decision-complete 计划 + 等批准）为技能 `omo-ulw-plan` | ✅ |
+| Prometheus 规划审批 → Atlas 执行 | `omo_ultrawork action=submit_plan plan=<完整 markdown>` 弹出 Approve / Keep planning 卡；Approve 将全文写入 `.omo/plans/<planId>.md` 并切 Atlas；`/omo-mode off|plan|exec` 手动切换（兼容 `on`） | ✅ |
 | 假设驱动调试（debugging skill） | 技能 `omo-debugging`（≥3 假设并行验证 / 两轮未破换正交角度 / 失败测试锁根因 / 清痕迹） | ✅ |
 | 实现后审查（review-work skill） | 技能 `omo-review-work`（5 路并行审查：目标/质量/安全/QA/上下文，全过才过） | ✅ |
 | /init-deep 分层 AGENTS.md | 技能 `omo-init-deep`（复杂度评分定层级 / 并发探索 / 跨层去重） | ✅ |

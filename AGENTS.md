@@ -18,8 +18,8 @@
 | 编译宿主 | `bash scripts/build.sh`（= `npm run build`） | exit 0 |
 | 宿主类型检查 | `npx tsc -p tsconfig.json --noEmit` | exit 0，无诊断 |
 | 客户端类型检查 | `npx tsc -p tsconfig.client.json --noEmit` | exit 0，无诊断 |
-| 编译客户端 | `bash scripts/build-client.sh` | exit 0，`lib/client.js` 16984 bytes |
-| 测试 | `node --test`（**不要传 `test/`**） | exit 0，2 suite / 19 断言通过 |
+| 编译客户端 | `bash scripts/build-client.sh` | exit 0，`lib/client.js` 20518 bytes（2026-10-01） |
+| 测试 | `node --test`（**不要传 `test/`**） | exit 0，7 tests 全通过（2026-10-01） |
 
 - **本仓库不 `npm install`**：`scripts/build.sh:18-30` 从 `~/.dsh/profiles/node_modules` 或 `/usr/lib/node_modules/@deepseek-ai/dsh/node_modules` 探测一份 DSH 依赖树，`link_pkg`（`:41-55`）把 cordis / dsh-tools / dsh-llm / dsh-scope / dsh-session / schemastery 等 symlink 进本地 `node_modules`，再用系统 `tsc` 编译（`:79-81`）。所以 `node_modules` 全是 symlink，删了会被下次 build 重建。
 - 客户端链路是"编译到临时目录再包装"：`tsc -p tsconfig.client.json` → `.build-client/` → `scripts/wrap-client.mjs` 包成 `window.__ModuleLoader__.load('@dsh-external/dsh-oh-my-agent', …)` 写入 `lib/client.js` → 清理临时目录（`scripts/build-client.sh:17-26`、`scripts/wrap-client.mjs:51-66`）。
@@ -31,14 +31,15 @@
 - `package.json:42-51`：`dsh.bundle.patch: ./cordis.patch.yml`；`dsh.client.inject: ["@deepseek-ai/dsh-client-ui-slots"]` + `platform: "web"`。
 - `cordis.patch.yml:1-7`：向 web 插件 roster `insert` `id: dsh-oh-my-agent` / `name: @dsh-external/dsh-oh-my-agent`。
 - 两种装法：`dev_inject_plugin`（dsh-super-injector 运行时注入，免重启）或 `dsh plugin --profile web add <path>`。
-- **本目录不是被 DSH 加载的那份**。改完必须 build → 同步到部署副本 → `dev_reload_package`，链路见上层 `../AGENTS.md`。
+- **本目录就是被 DSH 加载的那份**（2026-10-01 起 profile `link:` 直指这里，部署副本层已取消）。改完 build → `dev_reload_package` 即可，链路见上层 `../AGENTS.md`；**构建即上线**，未意图上线的改动别编译。
 
 ## 接口面（改动这些 = 改对外契约）
 
 - **22 个 `omo_*` 工具**，全部在 `src/index.ts` 的 `buildTools()` 内定义（`:278` 起，逐项行号见 `src/AGENTS.md`），过滤（`:2015-2023`）后统一 `ctx.tools.register`（`:2025-2028`）。过滤规则：`omo.jsonc` 的 `disabled_tools` + `hashline_edit` / `monitor` 开关（`:2009-2023`）。
 - **18 个技能**：定义在 `src/skills.ts`（`SkillRegistration` 对象数组），`skillRegistrations()` 汇总（`:183-185`），宿主循环注册（`src/index.ts:2030-2033`）。
 - **7 条 HTTP 路由** `/dsh-oh-my-agent/api/{status,goalguard,scan,boulder,monitors,note,modelroutes}`，`webServer.register` 且 `kind: 'exact'`（`src/index.ts:2058-2184`）；客户端卡片靠它们取数。
-- **客户端 UI 挂 `settings.plugins.tab`**（slot 名版本敏感，见 `src/client/AGENTS.md`）。
+- **客户端 UI 挂两处 slot**：`settings.plugins.tab`（OmO 控制台卡片）+ `conversation.input.left`（composer 会话模式下拉，2026-10-01 新增；slot 名与 list/single 语义均版本敏感，见 `src/client/AGENTS.md`）。
+- **1 条 slash 命令 `/omo-mode off|plan|exec`**（嵌套 `inject(['commands'])` 注册，`src/index.ts` apply 内）：写通道，等价 `omo_session_model`；投影 `omo-session-mode`（`src/sessionModel.ts` `sessionModeProjectionUnit`）承载读通道。
 - **消息 kind `'oh-my-agent'`**（`src/messageSource.ts:21`）：只做类型层 `MessageSourceMap` 增强，运行时无需注册；但该值**会持久化进会话日志，不能随包改名**。
 - **11 个 agent 角色档案**：`src/agents.ts:40-199`，每角色显式 `category`（sisyphus/prometheus→deep、atlas/oracle/metis→ultrabrain、hephaestus→unspecified-high、librarian/explore/sisyphus-junior→quick、momus→deep、multimodal-looker→visual）。
 
