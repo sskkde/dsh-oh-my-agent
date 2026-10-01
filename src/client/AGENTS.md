@@ -1,6 +1,6 @@
 # AGENTS.md — src/client（客户端半体）
 
-单文件 UI 半体：`index.ts`（402 行）注册「OmO 控制台」卡片；`react.d.ts` 只为离线 typecheck 提供 React 类型，**运行时 React 由 DSH ModuleLoader 提供**（`react.d.ts:1-20`），因此这里用裸 `createElement`（无 JSX）、不引第三方 UI 依赖。
+单文件 UI 半体：`index.ts` 注册两处界面（「OmO 控制台」设置页卡片 + composer 会话模式下拉）。`react.d.ts` / `primitives.d.ts` 只为离线 typecheck 提供类型，**运行时由 DSH ModuleLoader 提供**（`react.d.ts:1-20`），因此这里用裸 `createElement`（无 JSX）；UI 原语（`Menu`、图标）统一取自 DSH 自带的 `@deepseek-ai/dsh-client-ui-primitives`，不引第三方 UI 依赖。
 
 ## 挂载契约
 
@@ -28,7 +28,10 @@ ctx.slots.inject('conversation.input.left', () => ctx.slots.register({
 - slot 名 `settings.plugins.tab` 是 **DSH 0.1.7 起的名字**；旧的 `settings.plugin.item` 已移除——升版时 slot 名是第一个要核对的东西。
 - `id` 必须与宿主插件 id 一致（`dsh-oh-my-agent`），`order` 决定 tab 排序；list slot 需**全局唯一 id**（故用 `dsh-oh-my-agent:mode`）。
 - 下拉**读** `useProjection('omo-session-mode')`（宿主投影，见 `../sessionModel.ts` 的 `sessionModeProjectionUnit`），**写**走 session 命令 `/omo-mode`——不新增 HTTP 路由。
-- 降级：`useProjection` 缺失 / 读取抛错 / 值非法 → 渲染静态「会话模式不可用」且禁用，不发写请求。
+- **标签用角色名**：off→`Sisyphus`、prometheus→`Prometheus`、atlas→`Atlas`（`SESSION_MODE_ROLE` 同时持命令映射 off/plan/exec 与 tooltip）。
+- **视觉与旁边控件统一**：触发器结构照抄原生权限控件（`Menu` 原语 + `anchor=button` + 图标/标签/chevron），CSS **逐条复制** `ui-permission-presets/PermissionSelect.module.css` 的声明（只改前缀为 `omoMode_`），并沿用其注入方式（`<style data-plugin-css>`）。
+- **可 require 的客户端原语**：`@deepseek-ai/dsh-client-ui-primitives`（`Menu`/图标等）由 ModuleLoader 共享表提供，**无需**写进 `dsh.client.inject`——原生包与第三方插件（`dsh-better-sidebar`、`dsh-client-ui-git-graph`）都这么用。类型声明在 `primitives.d.ts`（离线 tsc 用），已加入 `tsconfig.client.json` 的 `include`。
+- 降级：`useProjection` 缺失 / 读取抛错 / 值非法 → 渲染禁用的「会话模式不可用」按钮，不发写请求。
 
 ## 与宿主通信
 
@@ -48,7 +51,7 @@ bash scripts/build-client.sh        # tsc -p tsconfig.client.json → .build-cli
 npx tsc -p tsconfig.client.json --noEmit   # 单独 typecheck
 ```
 
-- `tsconfig.client.json`：ES2020 / CommonJS / 含 DOM 类型 / `outDir: .build-client` / `rootDir: src/client`，只纳入 `index.ts` 与 `react.d.ts`（`:3-18`）。
-- `scripts/wrap-client.mjs:51-66` 把编译结果包成 `window.__ModuleLoader__.load('@dsh-external/dsh-oh-my-agent', …)` 写入 `lib/client.js`；相对 `require` 会内联（`:25-49`）。当前产物无本地模块内联（16984 bytes）。
+- `tsconfig.client.json`：ES2020 / CommonJS / 含 DOM 类型 / `outDir: .build-client` / `rootDir: src/client`，纳入 `index.ts` + 两份 `.d.ts`（`react.d.ts`、`primitives.d.ts`）。
+- `scripts/wrap-client.mjs:51-66` 把编译结果包成 `window.__ModuleLoader__.load('@dsh-external/dsh-oh-my-agent', …)` 写入 `lib/client.js`；**相对** `require` 会内联（`:25-49`），**裸** `require`（`react`、`@deepseek-ai/dsh-client-ui-primitives`）留给运行时模块表解析。当前产物 24324 bytes、无本地模块内联。
 - **改了客户端必须跑 `build-client.sh`**：`scripts/build.sh` 只管宿主，两个产物（`lib/*.js` 与 `lib/client.js`）都要各自构建后重载。**本目录就是被加载的那份**（2026-10-01 起部署副本层取消），构建即上线。
 - 交付前同样过一遍 `npx tsc -p tsconfig.client.json --noEmit`（实测 exit 0）。
