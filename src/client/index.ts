@@ -15,6 +15,9 @@ import { createElement, useEffect, useRef, useState } from 'react'
 /** Local React type surface; react stays an external at runtime. */
 type ClientContext = {
   effect: (fn: () => () => void, tag?: string) => () => void
+  remote: {
+    commands: { execute: (sessionId: string, command: string, args: unknown[]) => Promise<unknown> }
+  }
   slots: {
     inject: (slot: string, fn: () => unknown) => unknown
     register: (options: Record<string, unknown>, component: unknown) => unknown
@@ -385,18 +388,76 @@ const routeInput: Record<string, string | number> = {
   padding: '4px 8px',
 }
 
-/** Mount the console card. */
+type SessionMode = 'off' | 'prometheus' | 'atlas'
+type ModeSelectProps = {
+  sessionId?: string
+  select?: (mode: 'off' | 'plan' | 'exec') => Promise<unknown>
+  useProjection?: (key: string) => unknown
+}
+
+/** Compact composer mode selector; unavailable projection means read-only fallback. */
+export function ModeSelect(props: ModeSelectProps): unknown {
+  const [writeError, setWriteError] = useState('')
+  const projectionHook = props.useProjection
+  let projection: { mode?: SessionMode } | undefined
+  let projectionFailed = !projectionHook
+  if (projectionHook) {
+    try {
+      projection = projectionHook('omo-session-mode') as { mode?: SessionMode } | undefined
+    } catch {
+      projectionFailed = true
+    }
+  }
+  const mode = projection?.mode
+  const knownMode = mode === 'off' || mode === 'prometheus' || mode === 'atlas'
+  if (projectionFailed || !knownMode) {
+    return createElement('span', { style: { fontSize: 11, color: 'var(--dsw-alias-label-tertiary)' }, title: '会话模式投影不可用' }, '会话模式不可用')
+  }
+
+  const onChange = (event: { target: { value: string } }): void => {
+    const selected = event.target.value
+    if (!props.sessionId || !props.select || (selected !== 'off' && selected !== 'plan' && selected !== 'exec')) return
+    setWriteError('')
+    void Promise.resolve().then(() => props.select!(selected)).catch((error: unknown) => {
+      setWriteError(String((error as Error)?.message ?? error))
+    })
+  }
+
+  const selectedMode = mode === 'prometheus' ? 'plan' : mode === 'atlas' ? 'exec' : 'off'
+  return createElement('label', { style: { display: 'inline-flex', alignItems: 'center', gap: 5 } },
+    createElement('span', { style: { fontSize: 11, color: 'var(--dsw-alias-label-secondary)' } }, '会话模式'),
+    createElement('select', { value: selectedMode, onChange, disabled: !props.sessionId || !props.select, style: select, title: writeError || undefined }, 
+      createElement('option', { value: 'off' }, 'off'),
+      createElement('option', { value: 'plan' }, '计划态'),
+      createElement('option', { value: 'exec' }, '执行态')),
+    writeError ? createElement('span', { role: 'status', style: { fontSize: 10, color: 'var(--dsw-alias-state-error-primary)' } }, '切换失败') : null)
+}
+
+/** Mount the console card and composer mode selector. */
 export function apply(ctx: ClientContext): void {
   if (!ctx.slots) return
   ctx.effect(() => {
-    const disposer = ctx.slots.inject('settings.plugins.tab', () => ctx.slots.register({
+    const disposers: Array<() => void> = []
+    const consoleDisposer = ctx.slots.inject('settings.plugins.tab', () => ctx.slots.register({
       name: 'settings.plugins.tab',
       id: 'dsh-oh-my-agent',
       order: 120,
       label: () => 'OmO 控制台',
       inject: () => ({}),
     }, OmOConsoleCard))
-    if (typeof disposer === 'function') return () => (disposer as () => void)()
+    if (typeof consoleDisposer === 'function') disposers.push(consoleDisposer as () => void)
+
+    const modeDisposer = ctx.slots.inject('conversation.input.left', () => ctx.slots.register({
+      name: 'conversation.input.left',
+      id: 'dsh-oh-my-agent:mode',
+      order: 10,
+      inject: (sessionId: string) => ({
+        sessionId,
+        select: (mode: 'off' | 'plan' | 'exec') => ctx.remote.commands.execute(sessionId, '/omo-mode ' + mode, []),
+      }),
+    }, ModeSelect))
+    if (typeof modeDisposer === 'function') disposers.push(modeDisposer as () => void)
+    if (disposers.length) return () => { for (const dispose of disposers) dispose() }
     return () => {}
   }, 'dsh-oh-my-agent: console card')
 }
