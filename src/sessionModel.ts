@@ -27,14 +27,42 @@
  *   工具 execute）都在 turn 内，满足约束；仍对追加失败做防御（ok:false，不静默）。
  * - 生效时序与官方 `session.selectModel` 同语义：**从切换后的下一次请求生效**。
  * - 不写 settings 全局默认（那是 apiproxy selectModel 的行为），粒度=当前会话。
- * - 进程重启后模式态丢失（日志中的模式 header 仍在，但注入段/写门状态复位）；
- *   重新触发对应技能即恢复。
+ * - 模式通过 omo/session-mode 事件持久化并由 omo-session-mode 投影读取；WeakMap 仅作投影不可读时的兼容回退。
  */
 
+import { z } from 'zod'
 import { findRole, type AgentRole } from './agents.js'
 import { resolveRoleRoute, DEFAULT_ROUTES, type DelegateRoutes } from './delegate.js'
 
 export type SessionMode = 'off' | 'prometheus' | 'atlas'
+
+const SESSION_MODE_EVENT = 'omo/session-mode'
+const SESSION_MODE_PROJECTION = 'omo-session-mode'
+
+/**
+ * Host `sessionProjections` service, re-read at call time.
+ * There is no public `session.projections.get()` API (`Session.projections` is a
+ * private message-projection field), so durability must come from this service —
+ * bound once from the plugin's nested `inject(['sessionProjections'], …)`.
+ */
+let projectionHost: { stateOf?: (session: unknown, key: string) => unknown } | null = null
+
+/** Bind the host projection service so the durable mode survives process restarts. */
+export function bindProjectionHost(service: unknown): void {
+  projectionHost = (service as { stateOf?: (session: unknown, key: string) => unknown } | null) ?? null
+}
+
+export function sessionModeProjectionUnit(): Record<string, unknown> {
+  return {
+    key: SESSION_MODE_PROJECTION,
+    stateVersion: 1,
+    stateSchema: z.object({ mode: z.union([z.literal('off'), z.literal('prometheus'), z.literal('atlas')]) }),
+    init: () => ({ mode: 'off' }),
+    apply: (state: { mode: SessionMode }, event: { type: string; data: { mode: SessionMode } }) =>
+      event.type === SESSION_MODE_EVENT ? { mode: event.data.mode } : state,
+    wire: { viewSchema: z.object({ mode: z.string() }), view: (state: { mode: SessionMode }) => ({ mode: state.mode }) },
+  }
+}
 
 export interface ModelConfig {
   provider: string
@@ -113,11 +141,25 @@ function sameRoute(a: ModelConfig | null, b: ModelConfig | null): boolean {
   return a.provider === b.provider && a.model === b.model
 }
 
+/** Durable mode event is additive: a failed append keeps the in-process state authoritative. */
+function appendModeEvent(session: SessionLike, mode: SessionMode): boolean {
+  try { session.append(SESSION_MODE_EVENT, { mode }); return true } catch { return false }
+}
+
 /** 当前会话模式（无状态视为 off）。 */
 export function sessionModeOf(agent: unknown): SessionMode {
   const s = sessionOf(agent)
   if (!s) return 'off'
-  return states.get(s)?.mode ?? 'off'
+  // In-process state wins: it is also the only record when the durable append failed.
+  const local = states.get(s)?.mode
+  if (local !== undefined) return local
+  // No in-process state (fresh process / restored session) -> read the durable projection.
+  // Any absent, malformed or throwing read keeps the pre-projection behavior (off).
+  try {
+    const projected = projectionHost?.stateOf?.(s, SESSION_MODE_PROJECTION) as { mode?: unknown } | undefined
+    if (projected && (projected.mode === 'off' || projected.mode === 'prometheus' || projected.mode === 'atlas')) return projected.mode
+  } catch { /* fall through to off */ }
+  return 'off'
 }
 
 export function isSessionMode(agent: unknown, mode: SessionMode): boolean {
@@ -151,10 +193,11 @@ export async function setSessionMode(
   const s = sessionOf(agent)
   if (!s) return { ok: false, reason: '无会话上下文（agent.session 不可用）' }
   const prev = states.get(s)
+  const currentMode = sessionModeOf(agent)
 
   if (mode === 'off') {
-    if (!prev || prev.mode === 'off') return { ok: true, mode: 'off', reason: '当前不在激活态（无操作）' }
-    const revert = prev.pre ?? defaultsRoute
+    if (currentMode === 'off') return { ok: true, mode: 'off', reason: '当前不在激活态（无操作）' }
+    const revert = prev?.pre ?? defaultsRoute
     if (!revert) {
       states.delete(s)
       return { ok: false, reason: '无法还原：无切换前快照且无会话默认 selection' }
@@ -166,12 +209,15 @@ export async function setSessionMode(
         return { ok: false, reason: `还原会话模型失败（request/header 追加被拒）：${String(e)}` }
       }
     }
-    states.delete(s)
+    // Only drop the in-process record when the durable 'off' event landed; otherwise
+    // the projection would still replay the previous mode after a restart.
+    if (appendModeEvent(s, 'off')) states.delete(s)
+    else states.set(s, { mode: 'off', pre: prev?.pre ?? null })
     return { ok: true, mode: 'off', route: revert }
   }
 
   // prometheus | atlas
-  if (prev?.mode === mode) return { ok: true, mode, route, reason: '已处于该模式（无操作）' }
+  if (currentMode === mode) return { ok: true, mode, route, reason: '已处于该模式（无操作）' }
   if (!route) return { ok: false, reason: `切换 ${mode} 模式缺少目标路由` }
   // pre 只在 off→非 off 时快照一次；模式互转保留最初的 pre
   const pre = prev?.pre ?? readConfig(s.requestHeader())
@@ -183,6 +229,7 @@ export async function setSessionMode(
     }
   }
   states.set(s, { mode, pre })
+  appendModeEvent(s, mode)
   return { ok: true, mode, route }
 }
 

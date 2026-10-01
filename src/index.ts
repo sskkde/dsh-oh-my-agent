@@ -38,7 +38,7 @@ import z from 'schemastery'
 import path from 'node:path'
 import { readFile } from 'node:fs/promises'
 import { existsSync, readdirSync } from 'node:fs'
-import { text, PLUGIN_ID, ensureDir, resolveWorkspace, nowTs, omoDir, stripUndefined } from './util.js'
+import { text, PLUGIN_ID, ensureDir, resolveWorkspace, nowTs, omoDir, stripUndefined, writeState } from './util.js'
 import { scanRules, refreshRulesState } from './rules.js'
 import { boulderSummary, listNotes, appendNote, updateNote, newThreadBoulder, checkpointBoulder, isSection, SECTIONS, loadBoulder, saveBoulder } from './boulder.js'
 import { applyHashlineEdits, describeLines, type HashEdit } from './hashline.js'
@@ -53,7 +53,8 @@ import { docsSearch, docsGet } from './docs.js'
 import { lookAt, LOOK_INTENTS } from './lookAt.js'
 import { registerSkills, listRegistered } from './dynamicSkills.js'
 import { omoPreExecute, omoPostExecute, hooksStatus, nestedDelegationGuard, registerPerAgentGuard, isDelegationTool, hooksConfigFor, sessionRulesBlockFor, type ExecLike, type HooksConfig } from './hooks.js'
-import { roleModelRoute, prometheusPlanRoute, sessionModeIntentOf, setSessionMode, sessionModeOf, type SessionMode, type ModelConfig } from './sessionModel.js'
+import { roleModelRoute, prometheusPlanRoute, sessionModeIntentOf, setSessionMode, sessionModeOf, sessionModeProjectionUnit, bindProjectionHost, type SessionMode, type ModelConfig } from './sessionModel.js'
+import { buildPlanReviewQuestion, goalFromPlan, interpretPlanReviewAnswer, validatePlanMarkdown } from './planReview.js'
 import { ATLAS_SECTION } from './atlasPrompt.js'
 import { OMO_MESSAGE_KIND } from './messageSource.js'
 import * as mem from './memory.js'
@@ -106,6 +107,10 @@ type AnyObj = Record<string, unknown>
 interface ToolsCtx { tools: { register(d: unknown): unknown; guard(g: (exec: ExecLike) => string | undefined): unknown } }
 interface SkillsCtx { skills: { register(d: unknown): unknown } }
 /** dsh-system-prompt service surface (loose; optional on the ctx). */
+interface OptionalInjectCtx {
+  inject(deps: string[], callback: (ctx: AnyObj) => void): unknown
+}
+
 interface SysPromptCtx {
   systemPrompt?: {
     section(s: { name: string; order: number; text: string | ((context: { agent?: unknown }) => string); complete?: boolean }): () => void
@@ -775,8 +780,10 @@ function buildTools(config: Config): ToolDefinition[] {
   tools.push(
     tool(
       'omo_ultrawork',
-      'ultrawork 纪律协议指挥器（复刻 oh-my-openagent）：传入 goal(+可选 waves 波浪委托结构与 verification 验证清单)创建/更新计划；phase 推进 plan→explore→waves→verify→deliver，返回当前阶段 playbook；cancel=true 清 boulder activePlan 水位（停止续跑，配合 /omo-cancel-ultrawork）。实际委托由你(代理)用原生子代理工具按 category 映射执行。',
+      'ultrawork 纪律协议指挥器：action=submit_plan 提交完整计划并弹审批卡，Approve 后落盘到 .omo/plans/<planId>.md 并切 Atlas；Keep planning 保持规划态。其余参数用于创建/推进 ultrawork 计划与清除水位。',
       {
+        action: { type: 'string', enum: ['submit_plan'] },
+        plan: { type: 'string', description: 'submit_plan 必填：完整 Markdown（必须以 # 开头）' },
         goal: { type: 'string' },
         phase: { type: 'string', enum: ['plan', 'explore', 'waves', 'verify', 'deliver'] },
         completed: { type: 'integer', description: '已完成的波浪数，用于 boulder RESUME 进度' },
@@ -811,11 +818,80 @@ function buildTools(config: Config): ToolDefinition[] {
           progress: { type: 'object', additionalProperties: true },
           markdown: { type: 'string' },
           message: { type: 'string' },
+          approved: { type: 'boolean' },
+          planPath: { type: 'string' },
+          mode: { type: 'string', enum: ['off', 'prometheus', 'atlas'] },
+          route: { type: 'string' },
+          feedback: { type: 'string' },
         },
       },
       (_a, v) => text(v.markdown ? String(v.markdown) : (v.message ? String(v.message) : '')),
       async (args, exec) => {
         const ws = wsFromExec(config, exec)
+        if (args.action === 'submit_plan') {
+          const planMarkdown = typeof args.plan === 'string' ? args.plan : ''
+          validatePlanMarkdown(planMarkdown)
+          if (sessionModeOf(exec.agent) !== 'prometheus') {
+            return { ok: false, approved: false, mode: sessionModeOf(exec.agent), message: '请先调用 omo_session_model state=on 进入规划态，再提交审批。' }
+          }
+          const userQuestions = ((hostCtx as unknown as { get?: (name: string) => unknown } | null)?.get?.('userQuestions')) as { ask?: (request: AnyObj) => Promise<{ answers?: unknown }> } | undefined
+          if (!userQuestions || typeof userQuestions.ask !== 'function') {
+            return { ok: false, approved: false, mode: 'prometheus', message: '当前宿主没有 userQuestions 审批卡；请使用聊天式批准后再继续。' }
+          }
+          let answers: unknown
+          try {
+            const result = await userQuestions.ask({ agent: exec.agent, signal: exec.signal, questions: [buildPlanReviewQuestion(planMarkdown)] })
+            answers = result.answers
+          } catch (error) {
+            const code = String((error as { code?: unknown } | null)?.code ?? error)
+            if (code.includes('ASK_CANCELLED')) return { ok: false, approved: false, mode: 'prometheus', message: '审批已取消；已停在规划态，等待你的消息。' }
+            if (code.includes('NO_PROVIDER')) return { ok: false, approved: false, mode: 'prometheus', message: '当前界面无法显示审批卡；请使用聊天式批准。' }
+            if (code.includes('DELEGATED_CALLER')) return { ok: false, approved: false, mode: 'prometheus', message: '子代理无法弹出审批卡；请把计划交回 root 编排者提交。' }
+            if (code.includes('CALLER_NOT_LIVE')) return { ok: false, approved: false, mode: 'prometheus', message: '当前会话 agent 已失效；请由 live 会话重新提交审批。' }
+            throw error
+          }
+          const choice = interpretPlanReviewAnswer(answers)
+          if (choice === 'keep') {
+            const first = (answers as Array<{ custom?: unknown }>)[0]
+            const feedback = typeof first?.custom === 'string' && first.custom.trim() ? first.custom.trim() : '用户选择继续规划。'
+            throw new Error(`Keep planning：保持在 Prometheus 规划态。用户反馈：${feedback}`)
+          }
+          if (choice !== 'approve') return { ok: false, approved: false, mode: 'prometheus', message: '审批卡未返回有效选择；已停在规划态，请重新提交。' }
+          const existingBoulder = loadBoulder(ws)
+          let ultraPlan = readUltraPlan(ws)
+          if (!existingBoulder.activePlan || !ultraPlan) {
+            const modelCfg = loadLayeredConfig(ws).merged
+            const waves = (Array.isArray(args.waves) ? args.waves as AnyObj[] : []).map((wave): Wave => {
+              const category = String(wave.category || 'quick')
+              const decision = resolveCategory({ category, mergedConfig: modelCfg })
+              return {
+                name: String(wave.name || 'wave'), category, goal: String(wave.task || ''),
+                files: Array.isArray(wave.files) ? wave.files.map(String) : [],
+                dependsOn: Array.isArray(wave.depends_on) ? wave.depends_on.map(String) : [],
+                ...(decision.chosen ? { model: { provider: decision.chosen.provider, model: decision.chosen.model, reasoning: decision.chosen.reasoning } } : {}),
+              }
+            })
+            const verification = Array.isArray(args.verification) ? args.verification.map(String) : ['run build/tests']
+            ultraPlan = createUltraPlan(ws, typeof args.goal === 'string' && args.goal.trim() ? args.goal : goalFromPlan(planMarkdown), waves, verification)
+          }
+          if (!/^uw-[a-z0-9]+$/.test(ultraPlan.id)) {
+            return { ok: false, approved: true, mode: 'prometheus', message: '计划水位的 planId 格式无效；为安全起见未写入文件或切换模式。' }
+          }
+          const planPath = `.omo/plans/${ultraPlan.id}.md`
+          try {
+            // Intentional direct write: approved plan artifact is not a user edit through the write tool.
+            ensureDir(omoDir(ws, 'plans'))
+            writeState(path.join(ws, planPath), planMarkdown)
+          } catch (error) {
+            return { ok: false, approved: true, mode: 'prometheus', message: `计划水位已建立，但完整计划写入失败（${String(error)}）；未切执行态。` }
+          }
+          const merged = loadLayeredConfig(ws).merged
+          const routes: DelegateRoutes = { provider: config.delegateProvider, flash: config.delegateFlashRoute, heavy: config.delegateHeavyRoute }
+          const routeResult = roleModelRoute('atlas', merged, routes)
+          const switched = await setSessionMode(exec.agent, 'atlas', routeResult, defaultsSelection())
+          if (!switched.ok) return { ok: false, approved: true, planPath, mode: 'prometheus', message: `计划已落盘，但切换 Atlas 失败（${switched.reason || '未知错误'}）；请手动调用 omo_session_model state=atlas。` }
+          return { ok: true, approved: true, planPath, mode: 'atlas', route: `${routeResult.provider}/${routeResult.model}`, message: '计划已批准、落盘并切换到 Atlas 执行态。' }
+        }
         // cancel：清 boulder activePlan 水位，停止 RESUME 续跑
         if (args.cancel === true) {
           const b = loadBoulder(ws)
@@ -2004,6 +2080,40 @@ function regOnce(ctx: Context, fn: () => unknown, tag: string): void {
 
 export function apply(ctx: Context, config: Config): void {
   hostCtx = ctx
+  // Optional dependency: projection-capable hosts get the durable view without making it a top-level requirement.
+  ;(ctx as unknown as OptionalInjectCtx).inject(['sessionProjections'], (scope) => {
+    const projections = scope.sessionProjections as { register(unit: unknown): unknown; stateOf?: (session: unknown, key: string) => unknown }
+    // Durability hang-off: `session.projections.get()` is not a public API, so the read
+    // path must go through this service (bound here, re-read at call time).
+    bindProjectionHost(projections)
+    if (projections && typeof projections.register === 'function') {
+      regOnce(ctx, () => projections.register(sessionModeProjectionUnit()), 'dsh-oh-my-agent: session mode projection')
+    }
+  })
+  // Optional command package remains a nested injection, never a root dependency.
+  ;(ctx as unknown as OptionalInjectCtx).inject(['commands'], (scope) => {
+    const commands = scope.commands as { register(definition: AnyObj): unknown }
+    if (!commands || typeof commands.register !== 'function') return
+    regOnce(ctx, () => commands.register({
+      definitionId: 'omo-session-mode',
+      name: 'omo-mode',
+      description: '切换会话模式：off | plan（prometheus）| exec（atlas）',
+      input: { hint: '[off|plan|exec]' },
+      handler: async ({ agent, rawInput }: { agent: unknown; rawInput: string }) => {
+        const value = rawInput.trim().toLowerCase()
+        const mode: SessionMode | null = value === 'off' ? 'off' : value === 'plan' || value === 'on' ? 'prometheus' : value === 'exec' ? 'atlas' : null
+        if (!mode) return { kind: 'error', text: '用法: /omo-mode off|plan|exec（on 兼容 plan）' }
+        const ws = wsForConfig(config, ((agent as { session?: { header?: { cwd?: string } } } | undefined)?.session?.header?.cwd))
+        const merged = loadLayeredConfig(ws).merged
+        const routes: DelegateRoutes = { provider: config.delegateProvider, flash: config.delegateFlashRoute, heavy: config.delegateHeavyRoute }
+        const route = mode === 'atlas' ? roleModelRoute('atlas', merged, routes) : mode === 'prometheus' ? prometheusPlanRoute(merged, routes) : undefined
+        const result = await setSessionMode(agent, mode, route, defaultsSelection())
+        return result.ok
+          ? { kind: 'success', text: `会话模式: ${mode}${result.route ? `（route=${result.route.provider}/${result.route.model}）` : ''}` }
+          : { kind: 'error', text: `切换失败: ${result.reason || '未知错误'}` }
+      },
+    }), 'dsh-oh-my-agent: /omo-mode command')
+  })
   ensureDir(omoDir(wsForConfig(config), '_meta'))
   ctxSkillsRegister = (d: unknown) => ((ctx as unknown as SkillsCtx).skills).register(d)
 

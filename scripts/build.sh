@@ -75,6 +75,11 @@ if [ -e "$WEB_NM/schemastery/package.json" ]; then
 else
   link_pkg schemastery "$DEP/@deepseek-ai/schemastery"
 fi
+if [ -e "$DEP/zod/package.json" ]; then
+  link_pkg zod "$DEP/zod"
+else
+  link_pkg zod "$GLOBAL_NM/zod"
+fi
 
 echo "=== Compiling host (src -> lib) ==="
 "$TSC" -p tsconfig.json
