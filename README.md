@@ -72,7 +72,7 @@
 
 - **派发** `delegate_as`（continuable）成功时：goal `active+armed` → `ctx.goals.disarm`
   （进程内，无耐久事件、不改 phase/revision），记 mark（goalId/revision）。
-- **等待窗口**（`subagents.listChildren` 仍有 `activity:'running'` 子代理时）：
+- **等待窗口**（`subagents.listDescendants` 仍有 `activity:'running'` 子代理时；`listChildren` 的 catalog 行无该字段，判活会恒 0）：
   goal 若被重新武装（等待中才设置 goal / 人类手动 resume）→ 再次 disarm。
 - **结算**（`session/event` 的 `user/message source.kind='subagent-settled'` 通知，
   或本会话 `turn/end`，或 `goal/changed`）：mark 未毒化、goal 仍 `active+disarmed` 且

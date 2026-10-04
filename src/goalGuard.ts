@@ -15,11 +15,13 @@
  *   - 全部结算（idle 且无 running 子代理）：mark 未毒化、goal 仍 `active+disarmed`
  *     且 id/revision 与 mark 一致 → `goals.resume` 重新武装，恢复正常自动续跑。
  *
- * "是否有子代理在跑"的判定用 `ctx.subagents.listChildren(parentSessionId)`：
- * 返回条目 `activity: 'running'` = 逻辑记录仍在 ctx.sessions（= 工作未结束、
- * 含 send_message 冷恢复的 epoch2）；`inactive` = 已 dispose。生命周期边
- * `subagent/end` 是"驻留期终止"边且经作用域过滤，外部监听器收不到（dsh-subagent
- * 文档明言），故不用事件计数。
+ * "是否有子代理在跑"的判定用 `ctx.subagents.listDescendants(parentSessionId)`：
+ * 只有它给每行补 `activity` 字段——`'running'` = 逻辑记录仍在 ctx.sessions（= 工作
+ * 未结束、含 send_message 冷恢复的 epoch2）；`'inactive'` = 已 dispose。
+ * `listChildren` **不补** `activity`（其返回类型 `SubagentCatalogEntry` 只有
+ * id/createdAt/mode/label），拿它判活恒为 0（2026-10-03 实测故障）。
+ * 生命周期边 `subagent/end` 是"驻留期终止"边且经作用域过滤，外部监听器收不到
+ * （dsh-subagent 文档明言），故不用事件计数。
  *
  * 毒化（poisoned）：等待窗口内出现 driver 的 fail-safe disarm 信号
  * （agent/error、回合 max-tokens/aborted）后，禁止自动 resume——不覆盖 harness
@@ -124,7 +126,7 @@ export class GoalGuard {
 
   /**
    * idle 决策（回合结束 + children 查询后调用；runningChildren 由调用方经
-   * subagents.listChildren 汇总）：
+   * subagents.listDescendants 汇总，见 countRunningChildren）：
    * - runningChildren > 0：等待窗口。goal armed → 返回 disarm（含刷新后的 mark）。
    *   （注意：此处刷新 mark 但不清毒化——毒化只随新派发清除。）
    * - runningChildren === 0：mark 有效、未毒化、goal 与 mark 匹配且 active+disarmed
@@ -189,4 +191,31 @@ export class GoalGuard {
       poisoned: st.poisoned,
     }))
   }
+}
+
+/** `subagents.listDescendants` 行的宽松形状（只取判活需要的字段）。 */
+export interface SubagentRowLike {
+  kind?: string
+  activity?: string
+  depth?: number
+}
+
+/**
+ * 数「仍在跑的后代子代理」。**只接受 listDescendants 的行**——它按 residency
+ * （记录是否 live 于 ctx.sessions）补 `activity`，与原生 `runningDescendants`
+ * 同源；`kind:'child' && activity==='running'` 即工作未结束（含 send_message
+ * 冷恢复的 epoch2）。diagnostic 行无 activity，自然被排除；所有深度都算（原
+ * 生 runningDescendants 亦如此）。空/非数组按 0。
+ *
+ * 注意：**不要**拿 `listChildren` 的结果喂这里——它的 `SubagentCatalogEntry`
+ * 根本没有 `activity` 字段，恒返回 0（2026-10-03 实测故障）。
+ */
+export function countRunningChildren(rows: readonly SubagentRowLike[] | undefined): number {
+  if (!Array.isArray(rows)) return 0
+  let n = 0
+  for (const row of rows) {
+    if (row?.kind !== 'child') continue
+    if (row.activity === 'running') n += 1
+  }
+  return n
 }
