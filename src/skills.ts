@@ -129,8 +129,18 @@ context. Author them so future agents obey project conventions.
 
 ## Files that count
 - \`AGENTS.md\` / \`CLAUDE.md\` at workspace root (global, alwaysApply).
+- Sub-directory \`AGENTS.md\` (any depth): **directory-scoped** — applies only
+  inside its own subtree; discovered root→deep along the target's real ancestor
+  chain. Sub \`CLAUDE.md\` files are not loaded. alwaysApply / empty globs never
+  lift the directory scope, and a local AGENTS is never escalated into the
+  session standing rules.
 - \`*.mdc\` anywhere (Claude-style rule files).
-- \`rules/**/*.md\`, \`.rules/**/*.md\`, \`.agents/rules/**\`, \`.opencode/rules/**\`.
+- \`rules/**\`, \`.rules/**\`, \`.openagent/**\`, \`.agents/rules/**\`, \`.opencode/rules/**\`
+  (within the 10-level scan depth).
+- Trust boundary = the workspace itself: \`../\` escapes, prefix collisions
+  (\`src2/\` is not \`src/\`), absolute external paths and symlinks pointing
+  outside contribute nothing. Parent directories above the workspace are never
+  searched.
 
 ## Frontmatter
 \`\`\`markdown
@@ -143,19 +153,23 @@ applyTo: [file, session, tool]
 Rule body...
 \`\`\`
 
-## Injection channels (applyTo)
-- \`file\`（默认含）— edit 工具按目标路径注入（rules-injector 后置挂点）。
-- \`session\` — 会话开始时注入一次（pre-step 监听；仅 alwaysApply 且 applyTo 含
-  \`session\` 的"常设守则"走此通道，避免普通规则双重刷屏）。
-- \`tool\` / \`user_prompt\` — 预留，尚无自动通道；不写 \`file\` 的规则在文件编辑
-  时不会注入（通道门对 alwaysApply 同样生效）。
+## Injection channels (applyTo) — honest list
+- \`file\`（默认含）— 成功 \`edit\` 与成功 \`read\` 后按目标路径注入有界规则包
+  （rules-injector 后置挂点；2500 字符预算，整条装填，省略显式 contextIncomplete + 来源清单）。
+- \`session\` — 会话开始时注入一次（pre-step 监听；仅根级 alwaysApply 且 applyTo 含
+  \`session\` 的"常设守则"走此通道，局部规则不升级）。
+- \`tool\` / \`user_prompt\` — 预留，尚无自动通道。
+- **不自动注入的渠道**：bash、write、omo_hashline_edit、自定义工具——需要时显式
+  \`omo_rules action=path\` 查询；docs/ 与 notes 正文不自动注入。
+- 注入是提示上下文，不是写入前强制安全门。规则文件随代码维护更新，没有"零维护"承诺。
 
 ## Usage
 - \`omo_rules\` action=scan → list every rule file found + parse status.
-- \`omo_rules\` action=path path=src/foo.ts → which rules apply to that file (globs matched; file channel).
+- \`omo_rules\` action=path path=src/foo.ts → which rules apply to that file (ancestors root→deep, with sources; file channel).
 - \`omo_rules\` action=compile → compile all matching rules into \`.omo/rules/compiled.md\`.
 - Precedence: user(\`~/.omo/rules\`) < workspace root < deeper dirs (deeper wins);
-  alwaysApply rules are injected first.`,
+  alwaysApply rules are injected first. Rule edits take effect on the next
+  resolution (no TTL cache).`,
 }
 
 const HANDOFF_SKILL: SkillRegistration = {
@@ -228,6 +242,10 @@ const MEMORY: SkillRegistration = {
 - **干活中**：学到约定/踩坑/决策 → \`put\` 写到 learnings.md / decisions.md / issues.md（或 create 新文件）。
 - **收尾**：\`reflect\`（从 boulder 汇经验）→ \`compile\` 更新注入块 → \`search\` 复核。
 - **抽取**：\`extract\` 从对话/文本自动提炼事实写 facts.md。
+
+## 与项目知识分层的关系（别记错地方）
+- 记忆条目要**带来源**（文件/命令/URL），写成"结论 + 出处"的短摘要；memory 是经验线索，不是第二权威。
+- 现行事实归 docs/、行动规则归 AGENTS/规则文件、决策因果归 .agent-notes/notes/——memory 只存指针与经验，不复制它们的正文。
 
 ## 常见动作
 - status / list / read {name}
@@ -551,13 +569,18 @@ const INIT_DEEP: SkillRegistration = {
   source: 'runtime',
   content: `# omo-init-deep - 分层 AGENTS.md 知识库（OmO /init-deep 移植）
 
-生成分层 AGENTS.md：项目根一份全局上下文，复杂子目录各一份局部上下文。后续 agent 读文件时自动命中最近层，零手工维护。
+生成分层 AGENTS.md：项目根一份全局上下文，复杂子目录各一份局部上下文。后续 agent 读取深层文件时按
+**祖先路径**逐级命中各层 AGENTS（根 → 目标父目录，只适用目录子树；加载契约见插件
+docs/subsystems/rule-loading.md）。AGENTS 只装简短稳定的行动规则；详细架构写 docs/，决策因果写
+.agent-notes/notes/（职责规范见插件 docs/project-knowledge.md）。文档随代码维护更新，没有"零维护"承诺。
 
 \`\`\`
 project/
-├── AGENTS.md            ← 全局：构建命令/测试/约定/架构总览
+├── AGENTS.md            ← 全局：硬约束/关键验证命令/导航（不复制架构正文）
+├── docs/                ← 现行事实：架构、子系统契约（按需建）
+├── .agent-notes/notes/  ← 决策因果：背景/选择/否决项/证据（按需建）
 ├── src/
-│   ├── AGENTS.md        ← src 层：模块地图/内部约定
+│   ├── AGENTS.md        ← src 层：仅该层特有的规则与契约链接
 │   └── components/
 │       └── AGENTS.md    ← 组件层：仅当足够复杂时
 \`\`\`
@@ -576,8 +599,8 @@ project/
 对每个候选目录评分（文件数 / 子目录数 / 与根的距离 / 是否独立子系统）。**只有显著复杂的目录才立 AGENTS.md**，简单目录不立（宁缺毋滥）。
 
 ### 3. 生成（根先，子目录并行）
-- 根 AGENTS.md：构建/测试/lint 命令、架构总览、全局铁律（从 omo_rules compile 与既有约定提炼）。
-- 子目录：只写**该层特有**的内容（模块职责/内部契约），不重复根的。写前先 omo_hashline_lines 行锚，编辑用 omo_hashline_edit。
+- 根 AGENTS.md：构建/测试/lint 命令、全局铁律、往 docs/ 的导航（从 omo_rules compile 与既有约定提炼；架构正文写 docs/，AGENTS 放链接）。
+- 子目录：只写**该层特有**的内容（局部规则/内部契约链接），不重复根的；子 AGENTS 只适用其目录子树。写前先 omo_hashline_lines 行锚，编辑用 omo_hashline_edit。
 
 ### 4. 审查
 - 跨层去重（同一句话出现两层 = 删下层）。

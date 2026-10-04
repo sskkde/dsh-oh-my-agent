@@ -10,7 +10,7 @@ import path from 'node:path'
 import fs from 'node:fs'
 import { boulderSummary, type Section } from './boulder.js'
 import { omoDir, readJson } from './util.js'
-import { RulesIndex } from './rules.js'
+import { RulesIndex, scanRules, compileRules } from './rules.js'
 import type { UltraPlan } from './ultrawork.js'
 
 export interface HandoffInput {
@@ -28,6 +28,18 @@ export function buildHandoff(ws: string, input: HandoffInput): string {
   lines.push('')
   lines.push(`- **Workspace:** ${ws}`)
   lines.push(`- **Generated:** ${new Date().toISOString()}`)
+  lines.push('')
+
+  // Knowledge responsibility map (docs/project-knowledge.md): one authoritative
+  // body per knowledge kind. This handoff never auto-collects docs/notes prose
+  // — the receiver reads them on demand via the AGENTS navigation.
+  lines.push('## Knowledge map（知识职责——每类知识一个权威正文）')
+  lines.push('- 行动规则：`AGENTS.md` / 规则文件（根级=常设；子目录 AGENTS 只适用其目录子树）。')
+  lines.push('- 现行事实：`docs/`（architecture / subsystems / cookbook，按需建）。')
+  lines.push('- 决策因果：`.agent-notes/notes/<topic>.md`（`learnings.md` 是短索引）。')
+  lines.push('- 任务工件：`.omo/` 按类别保留批准计划、人工记忆、任务状态与验收证据；compiled rules / 索引是可重建派生物，不得整体当作可删缓存。')
+  lines.push('')
+  lines.push('> **声明**：本交接**不会自动收集** docs/ 与 notes 的正文——按 AGENTS 里的导航按需 `read`。')
   lines.push('')
 
   if (input.goal) {
@@ -50,8 +62,19 @@ export function buildHandoff(ws: string, input: HandoffInput): string {
     if (idx && fs.existsSync(compiledPath)) {
       const body = fs.readFileSync(compiledPath, 'utf8').slice(0, 2000)
       lines.push(body || '_no compiled rules_')
+      lines.push('')
+      lines.push('> 以上为编译块快照（截断至 2000 字符），不保证完整；完整适用规则用 `omo_rules action=path path=<目标>` 查询。')
     } else {
-      lines.push('_No compiled rules yet — run `omo_rules scan`._')
+      const rootRules = scanRules(ws).filter((r) =>
+        !r.scopeDir && ['AGENTS.md', 'CLAUDE.md'].includes(r.relPath),
+      )
+      if (rootRules.length) {
+        lines.push(compileRules(rootRules))
+        lines.push('')
+        lines.push('> **不完整快照**：没有 compiled rules；以上仅为当前根级 AGENTS/CLAUDE 导航与正文。完整适用规则用 `omo_rules action=path path=<目标>` 查询。')
+      } else {
+        lines.push('_No compiled rules or root AGENTS.md/CLAUDE.md found — run `omo_rules scan`._')
+      }
     }
     lines.push('')
   }

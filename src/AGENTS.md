@@ -10,7 +10,7 @@
 | 公共底座 | `util.ts`、`glob.ts`、`cmd.ts`、`xxhash32.ts`、`hashline.ts` | 路径/IO/workspace 解析、glob 匹配、子进程、行哈希锚点编辑 |
 | 委托路由 | `delegate.ts`、`agents.ts`、`modelRoute.ts` | 委托通道与三级路由、11 角色档案/简报/建队、category→fallback 链 |
 | 守卫 / 钩子 | `hooks.ts`、`goalGuard.ts`、`sessionModel.ts`、`messageSource.ts` | pre/post-execute 钩子与拦截门、goal 注入治理、会话模式 off/prometheus/atlas、消息 kind 声明 |
-| rules 引擎 | `rules.ts`（用 `glob.ts`） | 扫描 / 解析 frontmatter / glob 匹配 / 编译写 `.omo/rules/compiled.md` |
+| rules 引擎 | `rules.ts`（用 `glob.ts`）、`projectContext.ts` | 扫描 / 解析 frontmatter / glob 匹配 / 祖先 AGENTS 作用域与路径边界 / 编译写 `.omo/rules/compiled.md`；有界规则上下文组合（2500 字符、整条装填、显式 contextIncomplete、交付指纹）——hook 与 brief 共用 |
 | 记忆与状态 | `memory.ts`、`boulder.ts`、`handoff.ts`、`teamTask.ts`、`monitor.ts` | MemFS 记忆、boulder 笔记与 activePlan 水位、交接摘要、团队任务表、后台监控 |
 | ultrawork / 提示词 | `ultrawork.ts`、`sisyphusPrompt.ts`、`prometheusPrompt.ts`、`atlasPrompt.ts` | 计划状态机与波浪进度、三种会话纪律段文本 |
 | 代码智能 | `lsp.ts`、`codeSearch.ts`、`codegraph.ts`、`commentCheck.ts` | LSP 客户端、ast-grep/文本搜索、codegraph CLI 包装、阻断标记扫描 |
@@ -59,7 +59,7 @@
 
 - **ast-grep 退出码**：`0` = 有匹配、`1` = 无匹配（`--json` 时 stdout 为 `[]`）、`2+` = 用法/IO 错误；把 1 当失败会让"无匹配"被误报，rewrite 的"无匹配"是**成功空操作**（`codeSearch.ts:71-79`）。**`--lang` 必须留在同一条 argv 里**：曾把它拼成独立 shell 命令（`command not found`、exit 127），导致带语言过滤的搜索静默退化为文本后端（`codeSearch.ts:57-69`）。
 - **rules 空 body**：空正文规则（陈旧产物/占位符）必须返回 null 过滤掉，否则空注入（`rules.ts:114-117`）；扫描时跳过引擎自己的 `compiled.md`（`:159-161`）。
-- **rules-injector 的投递语义**（改这块前必读）：编译块缓存键是 `${ws}::${目标路径}`（5s TTL、`RULES_CACHE_MAX=200` 上限）——只按 `ws` 缓存时，5s 窗口内第二个被编辑的路径会拿到第一个路径的 glob 结果，**批量 edit 会投错规则**。投递去重是**组合判据**（`rulesDeliveryIsNew`）：账本记"转录里最新一条块 hash"（`lastGlobalHash`）+ "该路径上次投递的块"（`perPath`，上限 64），**两者都判定为新**才投；再叠 `RULES_REDELIVER_MS` 10 分钟窗口。效果：同块重复/批量交替重放都静默，块变化（**含 A→B→A 回退**）与超窗口则重投。所以**别假设"每次 edit 都会注入"，也别假设"投过就永不再投"**。channel 门与 glob 匹配仍见上层 `../README.md` 的「hooks 与守卫」。
+- **rules-injector 的投递语义**（改这块前必读）：成功 read/edit 按目标路径即时重扫并组合规则，**不再使用5s TTL编译缓存**；祖先作用域在通道/glob匹配前过滤。指纹覆盖完整来源、作用域、目标、正文、metadata和组合参数，含预算省略项；不同来源即使正文相同也保留独立作用域，同一来源的多个目标合并。投递去重是**组合判据**（`rulesDeliveryIsNew`）：账本记"转录里最新一条块 hash"（`lastGlobalHash`）+ "该路径上次投递的块"（`perPath`，上限 64），**两者都判定为新**才投；再叠 `RULES_REDELIVER_MS` 10 分钟窗口。效果：同块重复/批量交替重放都静默，块变化（**含 A→B→A 回退**）与超窗口则重投。所以**别假设"每次 edit 都会注入"，也别假设"投过就永不再投"**。channel 门与 glob 匹配仍见上层 `../README.md` 的「hooks 与守卫」。
 - **嵌套派发守卫**：只封 `delegate_as` 不够——`workflow` / `ralph` 内部直调 spawn 会绕过，故名单含这四个入口（`hooks.ts:379`），另在 `agent/created` 挂 per-agent 作用域守卫纵深（`index.ts:2205`、`:2219`）。判定用 `tools.guard`（`hooks.ts:430`）。
 - **goal-guard 只挂已验证通道**：`agent/status` 对根会话经作用域过滤**不可达**，决策触发器用 `session/event`（`user/message` 的 `subagent-settled` 结算通知、`turn/end` 兜底）与 `goal/changed`（`index.ts:2349-2380`，注释记录了实测结论）。"还有子代理在跑"用 `subagents.listChildren(...)` 的 `activity === 'running'` 判断，`subagent/end` 不等价于任务结算（`index.ts:2266-2301`、`goalGuard.ts:18`）。
 - **消息 kind 不能改名**：`'oh-my-agent'`（`messageSource.ts:21`）会写进会话日志，故取短名词而非 scoped 包名（`:15-19`）；消费者对未知 kind 向下穿透，运行时无需注册。

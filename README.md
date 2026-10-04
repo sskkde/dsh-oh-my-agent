@@ -17,7 +17,7 @@
 | OmO 功能 | 本插件实现 | 状态 |
 | --- | --- | --- |
 | `ultrawork` 纪律协议 / ulw-loop | `omo_ultrawork`（计划状态机 + 波浪式委托 playbook + category→子代理映射）+ 技能 `omo-ultrawork` | ✅ |
-| rules 引擎（.mdc / AGENTS.md，frontmatter + globs 匹配注入） | `omo_rules`（scan/compile/path）+ `rulesForPath` 编译块 | ✅ |
+| rules 引擎（.mdc / AGENTS.md，frontmatter + globs 匹配注入） | `omo_rules`（scan/compile/path）+ 祖先作用域规则组合：子 `AGENTS.md` 按目录子树命中（根 → 深层逐级、无 64 层上限，来源明确），workspace 即信任边界（`../`、前缀碰撞、所有 workspace 规则源外指 symlink fail-closed）；2500 字符有界组合（整条装填、省略显式 `contextIncomplete` + 来源清单），同源多目标合并 targets、不同来源正文不合并；完整 metadata 与组合参数参与 fingerprint。加载契约见 `docs/subsystems/rule-loading.md` | ✅ |
 | boulder 跨任务记忆（learnings/decisions/issues/verifications/problems） | `omo_note`（append/list/update/checkpoint/new-thread） | ✅ |
 | hashline 确定性精编（行号#2字符哈希，防 stale 误写） | `omo_hashline_edit` + `omo_hashline_lines`（xxhash32 16 符号字表） | ✅ |
 | ast-grep 结构化代码搜索 / 重写 / 扫描 | `omo_code_search`（search/rewrite/scan）— **ast-grep 0.45 真后端已内置**（@ast-grep/cli），AST 级匹配/落盘改写 | ✅ |
@@ -29,7 +29,7 @@
 | team mode 共享任务表 | `omo_team_task`（文件锁式共享队列） | ✅ |
 | memory-core 持久记忆（markdown MemFS + frontmatter 契约 + 事务日志 + compile 注入） | `omo_memory`（create/put/read/str_replace/insert/delete/rename/update_description/compile/search/reflect/extract/journal）+ 技能 `omo-memory` | ✅ |
 | model-core category->fallback 链路由 | `omo_model_route`（resolve/list，omo.jsonc `categories.<name>` 覆盖链与 reasoning 归一化）+ 技能 `omo-model-routing` | ✅ |
-| Pre/PostToolUse 生命周期 hooks | `omo_hooks`（8 个：write-existing-file-guard / comment-checker / rules-injector / read-only-gate / **edit-error-recovery** / **json-error-recovery** / **monitor-status-injector** / **hashline-read-enhancer**，挂 DSH tools/pre-execute + post-execute；失败路径走恢复指引，成功路径走检查/注入） | ✅ |
+| Pre/PostToolUse 生命周期 hooks | `omo_hooks`（8 个：write-existing-file-guard / comment-checker / rules-injector（成功 `edit` **与成功 `read`** 后按目标路径注入有界规则包，会话级指纹去重）/ read-only-gate / **edit-error-recovery** / **json-error-recovery** / **monitor-status-injector** / **hashline-read-enhancer**，挂 DSH tools/pre-execute + post-execute；失败路径走恢复指引，成功路径走检查/注入） | ✅ |
 | 子代理禁再派发（防嵌套委托） | nested-delegation-guard：全局 ToolGuard（子代理会话调用 `delegate_as`/`subagent*`/`workflow`/`ralph` 一律拒绝，含 `workflow.agent()`/`ralph` 内部直调 spawn 的绕过面，主会话不受影响）+ `agent/created` per-agent 作用域守卫纵深 + 委托时 `toolFilter` 使派发工具对子代理不可见；`hooks.nested_delegation_extra_tools` 逃生口、`hooks.nested_delegation_guard=false` 可关 | ✅ |
 | omo.jsonc 分层配置（用户层+项目层逐级覆盖，[opencode] 开关） | `omo_jsonc` + `disabled_tools`/`hashline_edit`/`monitor` 开关接线 | ✅ |
 | hyperplan 对抗式多智能体规划 | 技能 `omo-hyperplan` | ✅ |
@@ -97,8 +97,22 @@ dev_reload_package # 热重载
 dev_uninject_plugin
 ```
 
-状态约定：`<workspace>/.omo/{boulder.json,notepad.md,rules/,work/,plans/,monitors.json,monitor/,team/,checkpoints/}`。
-boulder 携带 `activePlan` 水位（id/名称/进度 total/completed/status）——ultrawork/start-work 的跨会话 RESUME 指针：`omo_ultrawork` 建计划即写水位，`completed` 参数推进，`deliver` 标记完成；`omo-start-work` 技能先查水位决定 RESUME 或 INIT。
+状态约定：`<workspace>/.omo/{boulder.json,notepad.md,rules/,work/,plans/,monitors.json,monitor/,team/,checkpoints/}`。`.omo/` 是位置，不代表内容皆为缓存：批准的 plans、人工 memory、Boulder 状态和验证证据应按类别保留/管理；compiled rules 与索引等明确派生产物可从来源重建。不要整体清空 `.omo/`。
+boulder 携带 `activePlan` 水位（id/名称/进度 total/completed/status）——ultrawork/start-work 的跨会话 RESUME 指针：`omo_ultrawork` 建计划即写水位，`completed` 参数推进，`deliver` 标记完成；`omo-start-work` 技能先查水位决定 RESUME 或 INIT。它是跨任务状态，不是临时编译缓存。
+
+交接边界：`omo_handoff` 不会自动采集 docs/notes 正文；可附加 compiled rules 快照（如果已存在），且有截断/完整性限制。缺快照时会提供根 AGENTS/CLAUDE 导航正文，但不等于完整收集全部规则或 docs/notes；接收者仍须按导航显式读取。不要把该交接能力表述为完整导航或通用只读权限。
+
+## 项目文档组织（本仓库自身示范）
+
+插件按四层职责组织项目知识（**AGENTS=行动规则 / docs=现行事实 / .agent-notes=决策因果 / .omo=按类别区分权威状态与派生产物**），
+每类知识一个权威正文：
+
+- [docs/project-knowledge.md](docs/project-knowledge.md) — 面向用户项目的信息架构规范（四层职责表、单权威来源、旧路径兼容、非目标）。
+- [docs/subsystems/rule-loading.md](docs/subsystems/rule-loading.md) — 规则加载现行契约：规则源与作用域、路径边界、通道与预算、交付去重、自动渠道诚实清单。
+- `.agent-notes/notes/project-knowledge.md` — 本轮设计的取舍与否决方案（notes 落点示范）。
+
+规则注入是提示上下文而非强制安全门；自动渠道仅限成功 read/edit、session 常设守则、brief/delegate_as 的
+files 目标与 `omo_rules action=path` 显式查询——bash、write、自定义工具不自动注入，docs/notes 正文不自动灌入。
 
 ## 分层配置开关（omo.jsonc）
 

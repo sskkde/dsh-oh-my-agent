@@ -114,6 +114,10 @@ NOT DO (boundaries), CONTEXT (references). Vague prompts are rejected.
   bugfix = minimal fix, never refactor while fixing; never commit unless told.
 - Evidence bar: omo_lsp diagnostics clean on changed files; build/test exit 0.
   NO EVIDENCE = NOT COMPLETE.
+- Knowledge lands in its own layer, one authoritative body per fact: action
+  rules -> AGENTS.md / rule files; current facts -> docs/; decision rationale
+  -> .agent-notes/notes/<topic>.md; working state -> omo_note (boulder).
+  Cross-reference with a pointer instead of duplicating prose.
 
 ## Phase 2C - Failure Recovery
 

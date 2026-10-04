@@ -75,15 +75,16 @@ export function rolePersona(role: AgentRole): string {
   )
 }
 
-/** 完整委托 prompt：标准简报 + 编排者本次补充 + 自包含环境说明。 */
+/** 完整委托 prompt：标准简报（可带规则上下文段）+ 编排者本次补充 + 自包含环境说明。 */
 export function composeDelegationPrompt(
   role: AgentRole,
   task: string,
   files: string[],
   extras: string,
   modelCfg: Record<string, unknown>,
+  context?: string,
 ): string {
-  let p = buildBrief(role, task, files, modelCfg)
+  let p = buildBrief(role, task, files, modelCfg, context)
   const ext = extras.trim()
   if (ext) p += `\n\n## 本次补充（编排者追加；与通用纪律冲突时按更窄者执行）\n${ext}`
   p += '\n\n## 执行环境\n你在独立上下文中运行，看不到母对话；以上简报自包含。收尾只输出最终报告（含 EVIDENCE），不要反问编排者。'
