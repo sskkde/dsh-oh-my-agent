@@ -203,12 +203,18 @@ export function findRole(name: string): AgentRole | undefined {
   return AGENT_ROLES.find((r) => r.name === n)
 }
 
-/** Build the complete delegation brief for one role. */
+/**
+ * Build the complete delegation brief for one role. `context` is the optional
+ * bounded rule-context block (projectContext.ruleContextForTargets) — appended
+ * as its own section so files[]-scoped rules stay grouped and never read as
+ * task-global mandates.
+ */
 export function buildBrief(
   role: AgentRole,
   task: string,
   files: string[],
   modelCfg: Record<string, unknown>,
+  context?: string,
 ): string {
   const dec = resolveCategory({ category: role.category, mergedConfig: modelCfg })
   const route = dec.chosen ? `${dec.chosen.provider}/${dec.chosen.model}${dec.chosen.reasoning ? ` (${dec.chosen.reasoning})` : ''}` : '未配置（用默认路由）'
@@ -234,6 +240,12 @@ export function buildBrief(
   lines.push('')
   lines.push(`## 模型路线（category=${role.category}）`)
   lines.push(`本任务选型：${route}。delegate_as 会自动按角色三级路由（delegate_roles > categories > 档位）选脑，本行仅供预期参考。`)
+  const ctx = (context ?? '').trim()
+  if (ctx) {
+    lines.push('')
+    lines.push('## 项目规则与知识入口（自动编译；遵守。局部要求不得放宽根级约束；docs/ 与 notes 正文不自动注入，按 AGENTS 导航按需 read）')
+    lines.push(ctx)
+  }
   return lines.join('\n')
 }
 

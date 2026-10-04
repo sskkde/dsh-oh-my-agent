@@ -13,13 +13,16 @@
  *       file for blocking markers. Modes (hooks.comment_checker): off | warn
  *       (default; attach a corrective context note) | block (hard-block the
  *       result toward the model).
- *   - rules-injector           : after a successful `edit`, attach the compiled
- *       rules for the target path as additional context (file channel). Each
- *       distinct block is delivered once per session; re-delivery happens only
- *       when the rules themselves changed. The compiled set is TTL-cached per
- *       (workspace, path). Standing `[session, tool]` rules are excluded by the
- *       channel gate and instead injected once per session by the pre-step
- *       listener in index.ts (session channel).
+ *   - rules-injector           : after a successful `edit` (existing) or a
+ *       successful `read` (adaptation: deep-AGENTS awareness before acting on
+ *       a file), attach the bounded rule context for the target path as
+ *       additional context (file channel; composed by projectContext — 2500
+ *       char budget, whole-rule granularity, explicit contextIncomplete).
+ *       Each distinct block is delivered once per session; re-delivery happens
+ *       only when the rules themselves changed. There is NO TTL cache: rule
+ *       edits are visible on the very next tool call. Standing
+ *       `[session, tool]` rules are excluded by the channel gate and instead
+ *       injected once per session by the pre-step listener in index.ts.
  *   - read-only planning gate  : agents whose preset is listed in
  *       hooks.read_only_agents may only write `*.md` inside `.omo/` (the
  *       Prometheus-style guard). The same gate also fires while the
@@ -58,9 +61,10 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
-import { omoDir, nowTs, isWithin, sha256 } from './util.js'
+import { omoDir, nowTs, isWithin } from './util.js'
 import { loadLayeredConfig } from './omoconfig.js'
-import { refreshRulesState, sessionRules, compileRules } from './rules.js'
+import { sessionRules, compileRules } from './rules.js'
+import { ruleContextForTargets } from './projectContext.js'
 import { checkComments } from './commentCheck.js'
 import { MonitorRegistry } from './monitor.js'
 import { isPlanningActive } from './sessionModel.js'
@@ -265,14 +269,11 @@ function buildEditRecovery(tool: string, fileRel: string | null, fails: number, 
 /** Recently-read paths (the write-guard "read-before-overwrite" ledger). */
 const recentReads = new Map<string, number>()
 
-/** Compiled-rules cache per (workspace, target path) — 5s TTL. The target is
- * part of the key on purpose: with a workspace-only key, the first edit of a
- * 5s window handed its glob-matched rule set to every other path edited right
- * after it (reproduced with a probe rule that only matched one file). */
-const rulesCache = new Map<string, { at: number; block: string }>()
-
-/** Size cap for the per-(workspace, path) rules cache (oldest evicted first). */
-const RULES_CACHE_MAX = 200
+/* The 5s-TTL per-(workspace, path) compiled-rules cache was removed on purpose
+ * (omo-project-documentation 计划已决契约 7): a TTL cache kept serving stale
+ * blocks for up to 5s after a rule edit. Rule resolution now runs fresh on
+ * every post-execute (scanRules reads the files each time), and spam control is
+ * entirely the delivery ledger below. */
 
 /** Rules blocks recently delivered in a session. Two lookups decide whether the
  * next delivery would add information:
@@ -325,37 +326,15 @@ function rulesDeliveryIsNew(session: unknown, targetRel: string, hash: string): 
   return true
 }
 
-function compiledRulesFor(ws: string, targetRel: string): string {
-  const key = `${ws}::${targetRel}`
-  const now = Date.now()
-  const cached = rulesCache.get(key)
-  if (cached && now - cached.at < 5000) return cached.block
-  // The key is per (workspace, path), so without pruning this map would grow
-  // with every file ever edited in the process. Expired entries go first, then
-  // the cap drops the oldest survivors.
-  for (const [k, v] of rulesCache) if (now - v.at >= 5000) rulesCache.delete(k)
-  if (rulesCache.size >= RULES_CACHE_MAX) {
-    const oldest = [...rulesCache.entries()].sort((a, b) => a[1].at - b[1].at)
-    for (let i = 0; i <= oldest.length - RULES_CACHE_MAX; i++) rulesCache.delete(oldest[i][0])
-  }
-  let state: ReturnType<typeof refreshRulesState> | null = null
-  try {
-    state = refreshRulesState(ws, targetRel)
-  } catch {
-    state = null
-  }
-  const block = state?.compiled ?? ''
-  rulesCache.set(key, { at: Date.now(), block })
-  return block
-}
-
 /** Session-channel standing-rules block cache per workspace (5s TTL). */
 const sessionRulesCache = new Map<string, { at: number; block: string }>()
 
 /**
  * Compiled block for the `session` channel: alwaysApply rules declaring
  * `applyTo` containing 'session' (see rules.sessionRules). Injected once per
- * session by the pre-step listener in index.ts — never by the file (edit) hook.
+ * session by the pre-step listener in index.ts — never by the file (edit/read)
+ * hook. The block is a once-per-session statement, so the 5s TTL here only
+ * bounds recompute cost; it cannot serve stale rules to a later delivery.
  */
 export function sessionRulesBlockFor(ws: string): string {
   const cached = sessionRulesCache.get(ws)
@@ -580,24 +559,27 @@ export async function omoPostExecute(
       } catch { /* contained */ }
     }
 
-    // 4) rules-injector: attach the compiled rules for this path (file channel —
-    //    matched through rulesForPath(ws, fileRel, 'file'), so rules whose
-    //    applyTo excludes 'file' (e.g. [session, tool]) never fire here).
-    //    Delivery is deduped per session against both the newest statement and
-    //    this path's previous block (see rulesDeliveryIsNew): an unchanged
-    //    repeat is suppressed, a changed block — A → B → A included — is
-    //    delivered, and the RULES_REDELIVER_MS window re-delivers after the
-    //    copy was compacted away. A change past the 2500-char cut is never
-    //    delivered either way.
-    if (hookEnabled(cfg, 'rules-injector') && cfg.rulesInjector && name === 'edit' && abs) {
+    // 4) rules-injector: attach the bounded rule context for this path (file
+    //    channel — composed by projectContext: ancestor AGENTS discovery,
+    //    workspace trust boundary, scope/channel gates, 2500-char budget with
+    //    whole-rule granularity and explicit contextIncomplete). Fires after a
+    //    successful `edit` (existing behaviour) and after a successful `read`
+    //    (rules awareness before acting on a file). Delivery is deduped per
+    //    session against both the newest statement and this path's previous
+    //    block (see rulesDeliveryIsNew): an unchanged repeat is suppressed, a
+    //    changed block — A → B → A included — is delivered, and the
+    //    RULES_REDELIVER_MS window re-delivers after the copy was compacted
+    //    away. The fingerprint covers ALL applicable entries (omitted included),
+    //    so a change past the budget cut still re-delivers. No TTL cache: rule
+    //    edits are visible on the very next tool call.
+    if (hookEnabled(cfg, 'rules-injector') && cfg.rulesInjector && (name === 'edit' || name === 'read') && abs) {
       try {
-        const block = compiledRulesFor(ws, fileRel ?? '')
+        const pkg = ruleContextForTargets(ws, [fileRel ?? ''])
         // Only deliver when there is actual rule content ('' when no rules
-        // matched); never fire for an empty shell.
-        if (block && block.trim().length > 0) {
-          const delivered = block.slice(0, 2500)
-          if (rulesDeliveryIsNew(exec.agent?.session, fileRel ?? '', sha256(delivered))) {
-            extra.push(ctxMessage(`[OMO HOOK · rules] 适用于 ${fileRel} 的已编译规则，请遵守：\n${delivered}`))
+        // apply); never fire for an empty shell.
+        if (pkg.block && pkg.block.trim().length > 0) {
+          if (rulesDeliveryIsNew(exec.agent?.session, fileRel ?? '', pkg.hash)) {
+            extra.push(ctxMessage(pkg.block))
           }
         }
       } catch { /* contained */ }

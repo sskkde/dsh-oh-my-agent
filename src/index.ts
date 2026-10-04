@@ -40,6 +40,7 @@ import { readFile } from 'node:fs/promises'
 import { existsSync, readdirSync } from 'node:fs'
 import { text, PLUGIN_ID, ensureDir, resolveWorkspace, nowTs, omoDir, stripUndefined, writeState } from './util.js'
 import { scanRules, refreshRulesState } from './rules.js'
+import { ruleContextForTargets } from './projectContext.js'
 import { boulderSummary, listNotes, appendNote, updateNote, newThreadBoulder, checkpointBoulder, isSection, SECTIONS, loadBoulder, saveBoulder } from './boulder.js'
 import { applyHashlineEdits, describeLines, type HashEdit } from './hashline.js'
 import { structuredSearch, astRewrite, astGrepScan } from './codeSearch.js'
@@ -280,7 +281,9 @@ function summarize(rules: ReturnType<typeof scanRules>): AnyObj[] {
   }))
 }
 
-function buildTools(config: Config): ToolDefinition[] {
+/** Exported for tests (rulesHooks.test.mjs captures the omo_agents brief
+ * entry); registration itself goes through apply(). */
+export function buildTools(config: Config): ToolDefinition[] {
   const tools: ToolDefinition[] = []
 
   // ─────────────────────────── omo_status ───────────────────────────
@@ -1532,7 +1535,10 @@ function buildTools(config: Config): ToolDefinition[] {
           const task = String(args.task || '')
           if (!task.trim()) return { ok: false, action, note: 'task required' }
           const files = Array.isArray(args.files) ? (args.files as unknown[]).map(String) : []
-          return { ok: true, action, brief: buildBrief(role, task, files, modelCfg), note: `简报已生成（可经 delegate_as role=${role.name} 一键派发）` }
+          // 同一有界规则组合（projectContext）服务 brief 与 hook：files 目标带
+          // 祖先规则包（files 为空仅根/常设规则），局部范围不提升为任务全局规则。
+          const contextPkg = ruleContextForTargets(ws, files)
+          return { ok: true, action, brief: buildBrief(role, task, files, modelCfg, contextPkg.block), note: `简报已生成（可经 delegate_as role=${role.name} 一键派发）` }
         }
         // team
         const goal = String(args.task || args.goal || '')
@@ -1602,7 +1608,10 @@ function buildTools(config: Config): ToolDefinition[] {
         const spec = res.spec
         const resolved = resolveRoleRoute(res.role, spec, routes, modelCfg)
         const routeStr = `${resolved.provider}/${resolved.model}（${resolved.source}）`
-        const prompt = composeDelegationPrompt(res.role, task, files, String(args.extras || ''), modelCfg)
+        // 与 omo_agents brief 同一 context 组合（projectContext）：files 目标祖先
+        // 规则包入简报，局部范围按目标标注、不提升为全局。
+        const contextPkg = ruleContextForTargets(ws, files)
+        const prompt = composeDelegationPrompt(res.role, task, files, String(args.extras || ''), modelCfg, contextPkg.block)
         const outcome = await runDelegation(subagents, {
           role: res.role,
           spec,
