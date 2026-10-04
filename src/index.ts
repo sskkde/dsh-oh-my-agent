@@ -67,7 +67,7 @@ import { SISYPHUS_SECTION } from './sisyphusPrompt.js'
 import { PROMETHEUS_SECTION } from './prometheusPrompt.js'
 import { loadTasks, saveTasks, type TaskRow } from './teamTask.js'
 import { loadLayeredConfig, mergedTools, mergedToggle, loadUserConfig, userRoutesFile, workspaceRoutesFile, readRoutesLayer, writeRoutesLayer, routesLayerExists } from './omoconfig.js'
-import { GoalGuard, type GoalsServiceLike } from './goalGuard.js'
+import { GoalGuard, countRunningChildren, type GoalsServiceLike, type SubagentRowLike } from './goalGuard.js'
 
 export const name = PLUGIN_ID
 // 'systemPrompt' is optional at runtime: hosts without dsh-system-prompt still
@@ -134,6 +134,8 @@ let goalGuardGoals: (() => GoalsServiceLike | undefined) | null = null
 const goalGuardDiag = {
   statusSeen: 0, statusIdleSeen: 0, goalChangeSeen: 0, idleRuns: 0,
   agentsMissing: 0, subsMissing: 0, listFails: 0, running: -1, disarms: 0, resumes: 0,
+  // disarms 总数 = 派发点 disarm + 等待窗口再 disarm；下两项为分解（排查用）。
+  dispatchDisarms: 0, windowDisarms: 0,
   dispatches: 0, dispatchAid: '', 
   sessionEvents: 0, sessionTurnEnds: 0, sessionSettled: 0, sessionKinds: [] as string[],
   last: '',
@@ -154,6 +156,8 @@ function delegateGoalGuardDispatch(agent: unknown): void {
     if (mark) {
       svc?.disarm(agent)
       guard.recordDisarm(aid, mark)
+      goalGuardDiag.disarms += 1
+      goalGuardDiag.dispatchDisarms += 1
       goalGuardLog?.(`[goal-guard] disarmed goal ${mark.goalId}@${mark.revision}（等待窗口不注入）`)
     }
   } catch (e) {
@@ -2382,8 +2386,11 @@ export function apply(ctx: Context, config: Config): void {
       goalGuardLog = log
 
       // ── children 查询与共享决策执行器 ──────────────────────────────
-      // "是否有子代理在跑"用 subagents.listChildren（activity==='running' = 记录仍
-      // live 于 ctx.sessions，即工作未结束，含 send_message 冷恢复的 epoch2）。
+      // "是否有子代理在跑"用 subagents.listDescendants——**只有它**给每行补
+      // `activity`（'running' = 记录仍 live 于 ctx.sessions，即工作未结束，含
+      // send_message 冷恢复的 epoch2；'inactive' = 已 dispose）。listChildren 的
+      // 返回类型 SubagentCatalogEntry 根本没有 activity 字段，拿它判活恒为 0
+      // （2026-10-03 实测故障：等待窗口不成立、goal 仍被注入）。
       // 不用 subagent/start|end 生命周期边：那是"驻留期终止"边且经作用域过滤，
       // 外部监听器收不到（dsh-subagent 文档明言）。查询失败按"有子代理在跑"
       // 保守处理（不自动 resume）。
@@ -2393,11 +2400,11 @@ export function apply(ctx: Context, config: Config): void {
         } catch { /* ignore */ }
         return undefined
       }
-      const subagentsSvc = (): { listChildren: (parentSessionId: string) => Promise<Array<{ activity?: string }>> } | undefined => {
+      const subagentsSvc = (): { listDescendants: (parentSessionId: string) => Promise<SubagentRowLike[]> } | undefined => {
         try {
           const svc = ((hostCtx as { get?: (k: string) => unknown } | null)?.get)?.('subagents')
-          if (svc && typeof (svc as { listChildren?: unknown }).listChildren === 'function') {
-            return svc as { listChildren: (parentSessionId: string) => Promise<Array<{ activity?: string }>> }
+          if (svc && typeof (svc as { listDescendants?: unknown }).listDescendants === 'function') {
+            return svc as { listDescendants: (parentSessionId: string) => Promise<SubagentRowLike[]> }
           }
         } catch { /* ignore */ }
         return undefined
@@ -2410,14 +2417,14 @@ export function apply(ctx: Context, config: Config): void {
             goalGuardDiag.last = `subagents svc missing (${agentId})`
             return 1
           }
-          const children = await subs.listChildren(agentId)
-          const running = children.filter((c) => c.activity === 'running').length
+          const rows = await subs.listDescendants(agentId)
+          const running = countRunningChildren(rows)
           goalGuardDiag.running = running
           return running
         } catch (e) {
           goalGuardDiag.listFails += 1
-          goalGuardDiag.last = `listChildren failed: ${String(e)}`
-          log(`[goal-guard] listChildren failed（按有子代理在跑保守处理）: ${String(e)}`, true)
+          goalGuardDiag.last = `listDescendants failed: ${String(e)}`
+          log(`[goal-guard] listDescendants failed（按有子代理在跑保守处理）: ${String(e)}`, true)
           return 1
         }
       }
@@ -2443,6 +2450,7 @@ export function apply(ctx: Context, config: Config): void {
             svc?.disarm(agent)
             guard.recordDisarm(agentId, dec.mark)
             goalGuardDiag.disarms += 1
+            goalGuardDiag.windowDisarms += 1
             log(`[goal-guard] waiting window: re-disarmed goal ${dec.mark.goalId}@${dec.mark.revision}（等待中设置/重新武装的 goal）`)
           } else if (dec.kind === 'resume') {
             try {

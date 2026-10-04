@@ -5,7 +5,7 @@
  * 修订不匹配不 resume / goal 非 active 清窗口 / runingChildren 判定 / 快照。
  */
 import assert from 'node:assert/strict'
-import { GoalGuard } from '../lib/goalGuard.js'
+import { GoalGuard, countRunningChildren } from '../lib/goalGuard.js'
 
 let passed = 0
 const ok = (name) => { passed += 1; console.log(`  ✓ ${name}`) }
@@ -136,6 +136,25 @@ const A = 'agent-1'
   assert.equal(g.guardedCount(), 0)
   assert.equal(g.has(A), false)
   ok('snapshot / guardedCount / reset / has')
+}
+
+// ── 10. countRunningChildren：只认 listDescendants 行（kind:'child' + activity）──
+{
+  const rows = [
+    { kind: 'child', depth: 1, activity: 'running' },
+    { kind: 'child', depth: 1, activity: 'inactive' },
+    { kind: 'child', depth: 2, activity: 'running' },
+    { kind: 'diagnostic', depth: 1, reason: 'unavailable' },
+  ]
+  assert.equal(countRunningChildren(rows), 2) // 两个 running child（含深度 2，与原生 runningDescendants 同源）
+  // 关键回归：listChildren 的 catalog 行没有 activity 字段 → 恒 0（修复前故障）
+  assert.equal(countRunningChildren([{ id: 'c1', mode: 'continuable', label: 'x' }]), 0)
+  // 空 / 非数组 / 缺字段 → 0（不误判）
+  assert.equal(countRunningChildren([]), 0)
+  assert.equal(countRunningChildren(undefined), 0)
+  assert.equal(countRunningChildren(null), 0)
+  assert.equal(countRunningChildren([{ kind: 'child' }]), 0)
+  ok('countRunningChildren：listDescendants 行按 running 计数；catalog 行恒 0')
 }
 
 console.log(`\ngoalGuard.test.mjs: ${passed} passed`)
