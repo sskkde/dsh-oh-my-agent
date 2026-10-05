@@ -200,6 +200,18 @@ test('files 为空：仅根 / 常设规则，不推断目录目标的后代规�
   assert.ok(!pkg.block.includes('SRC_RULE_MARK'), 'no files → no directory-scoped rules')
 })
 
+test('skip 在预算前过滤条目；全跳过返回空块', () => {
+  put('AGENTS.md', rule('ROOT_RULE_MARK', 'R'.repeat(1800)))
+  put('src/AGENTS.md', rule('SRC_RULE_MARK', 'S'.repeat(900)))
+  const skipped = ruleContextForTargets(ws, ['src/a.ts'], { skip: (e) => e.sources[0] === 'AGENTS.md' })
+  assert.equal(skipped.complete, true, 'filtered root must not consume budget or create omission')
+  assert.match(skipped.block, /SRC_RULE_MARK/)
+  assert.doesNotMatch(skipped.block, /ROOT_RULE_MARK|contextIncomplete/)
+  const empty = ruleContextForTargets(ws, ['src/a.ts'], { skip: () => true })
+  assert.equal(empty.block, '')
+  assert.deepEqual(empty.entries, [])
+})
+
 test('路径外目标被忽略；缺 workspace 返回空块不抛错', () => {
   put('AGENTS.md', rule('ROOT_RULE_MARK'))
   const pkg = ruleContextForTargets(ws, ['../outside.ts', '/etc/passwd'])

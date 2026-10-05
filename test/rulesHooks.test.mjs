@@ -13,7 +13,7 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { omoPostExecute } from '../lib/hooks.js'
+import { omoPostExecute, markSessionRulesDelivered } from '../lib/hooks.js'
 import { buildTools, apply } from '../lib/index.js'
 import { buildHandoff } from '../lib/handoff.js'
 import { ruleContextForTargets } from '../lib/projectContext.js'
@@ -202,31 +202,38 @@ test('metadata-only 规则变更导致 hook 重新投递', async () => {
   assert.match(allText(changed), /A_CHANGED_DESCRIPTION_LONGER/)
 })
 
-test('预算省略的规则变化仍由 hook 指纹触发重投', async () => {
+test('预算省略来源在祖先被跳过后可装入；省略来源变化仍重投', async () => {
   put('AGENTS.md', rule('LARGE_ROOT', 'R'.repeat(1800)))
   put('src/module/AGENTS.md', rule('OMITTED_LOCAL', 'S'.repeat(900)))
   const s = { header: { cwd: ws } }
   const first = await post('read', 'src/module/sample.txt', { session: s })
   assert.match(allText(first), /contextIncomplete/)
   assert.match(allText(first), /src\/module\/AGENTS\.md/)
+  const second = await post('read', 'src/module/sample.txt', { session: s })
+  assert.match(allText(second), /S{900}/, 'skipping delivered root frees budget for local rule')
+  assert.doesNotMatch(allText(second), /contextIncomplete/)
   put('src/module/AGENTS.md', rule('OMITTED_LOCAL', 'S'.repeat(901)))
   const changed = await post('read', 'src/module/sample.txt', { session: s })
-  assert.match(allText(changed), /contextIncomplete/)
+  assert.match(allText(changed), /S{901}/, 'changed source is delivered again')
 })
 
-test('10 分钟后相同规则可重投（时钟控制）', async () => {
-  const originalNow = Date.now
-  let now = 1_000_000
-  Date.now = () => now
-  try {
-    const s = { header: { cwd: ws } }
-    assert.match(allText(await post('read', 'src/module/sample.txt', { session: s })), /MODULE_RULE_MARK/)
-    assert.equal(allText(await post('read', 'src/module/sample.txt', { session: s })), '')
-    now += 10 * 60_000
-    assert.match(allText(await post('read', 'src/module/sample.txt', { session: s })), /MODULE_RULE_MARK/)
-  } finally {
-    Date.now = originalNow
-  }
+test('跨文件共享来源每会话只投一次', async () => {
+  put('src/module/a.txt', 'A')
+  put('src/module/b.txt', 'B')
+  const s = { header: { cwd: ws } }
+  const first = await post('read', 'src/module/a.txt', { session: s })
+  assert.match(allText(first), /ROOT_RULE_MARK/)
+  assert.match(allText(first), /MODULE_RULE_MARK/)
+  const second = await post('read', 'src/module/b.txt', { session: s })
+  assert.doesNotMatch(allText(second), /ROOT_RULE_MARK|MODULE_RULE_MARK/)
+})
+
+test('会话通道种子阻止 file 通道重复投递同来源', async () => {
+  put('standing.mdc', rule('SESSION_STANDING', 'SESSION_RULE_MARK', 'alwaysApply: true\napplyTo: [session, file]\n'))
+  const s = { header: { cwd: ws } }
+  markSessionRulesDelivered(s, ws)
+  const read = await post('read', 'src/module/sample.txt', { session: s })
+  assert.doesNotMatch(allText(read), /SESSION_RULE_MARK/)
 })
 
 test('handoff：根 AGENTS 无 compiled snapshot 时给正文并标明不完整', () => {

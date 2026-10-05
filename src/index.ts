@@ -53,7 +53,7 @@ import { resolveChannel, composeDelegationPrompt, getSubagentsService, runDelega
 import { docsSearch, docsGet } from './docs.js'
 import { lookAt, LOOK_INTENTS } from './lookAt.js'
 import { registerSkills, listRegistered } from './dynamicSkills.js'
-import { omoPreExecute, omoPostExecute, hooksStatus, nestedDelegationGuard, registerPerAgentGuard, isDelegationTool, hooksConfigFor, sessionRulesBlockFor, type ExecLike, type HooksConfig } from './hooks.js'
+import { omoPreExecute, omoPostExecute, hooksStatus, nestedDelegationGuard, registerPerAgentGuard, isDelegationTool, hooksConfigFor, sessionRulesBlockFor, markSessionRulesDelivered, type ExecLike, type HooksConfig } from './hooks.js'
 import { roleModelRoute, prometheusPlanRoute, sessionModeIntentOf, setSessionMode, sessionModeOf, sessionModeProjectionUnit, bindProjectionHost, type SessionMode, type ModelConfig } from './sessionModel.js'
 import { buildPlanReviewQuestion, goalFromPlan, interpretPlanReviewAnswer, validatePlanMarkdown } from './planReview.js'
 import { ATLAS_SECTION } from './atlasPrompt.js'
@@ -2667,6 +2667,7 @@ export function apply(ctx: Context, config: Config): void {
         const block = sessionRulesBlockFor(ws)
         if (!block || !block.trim()) return decision
         sessionRulesNotified.add(session)
+        markSessionRulesDelivered(session, ws)
         const notice = createUserMessage({
           content: [{ type: 'text', text: `[OMO HOOK · rules · session] 会话常设守则（每次会话注入一次，请遵守）：\n${block.slice(0, 2500)}` }],
           source: { kind: OMO_MESSAGE_KIND, form: 'notice', summary: 'rules session 守则注入' },

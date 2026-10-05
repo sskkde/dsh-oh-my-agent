@@ -64,6 +64,8 @@ export interface RuleContextOptions {
   channel?: RuleChannel
   /** Header override; defaults to the standard localized banner. */
   header?: string
+  /** Exclude already-delivered entries before budget composition. */
+  skip?: (entry: RuleContextEntry) => boolean
 }
 
 const FIXED_GUIDANCE = '也可用 omo_rules action=path path=<目标> 查询适用规则，行动前先 read 原文。'
@@ -140,6 +142,7 @@ export function ruleContextForTargets(
       targets: [],
       content: r.content,
     }
+    if (opts.skip && opts.skip(e)) continue
     entries.push(e)
     entryByFile.set(r.file, e)
   }

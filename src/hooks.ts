@@ -61,7 +61,7 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
-import { omoDir, nowTs, isWithin } from './util.js'
+import { omoDir, nowTs, isWithin, sha256 } from './util.js'
 import { loadLayeredConfig } from './omoconfig.js'
 import { sessionRules, compileRules } from './rules.js'
 import { ruleContextForTargets } from './projectContext.js'
@@ -275,55 +275,45 @@ const recentReads = new Map<string, number>()
  * every post-execute (scanRules reads the files each time), and spam control is
  * entirely the delivery ledger below. */
 
-/** Rules blocks recently delivered in a session. Two lookups decide whether the
- * next delivery would add information:
- *  - `lastGlobalHash` — the newest rules statement already in the transcript;
- *    re-sending the identical block would say nothing new;
- *  - `perPath` — the last block delivered for this edited path, i.e. whether
- *    this path's rules changed since the model last saw them.
- * A block is delivered only when BOTH say it is new. That keeps a batch of
- * alternating per-path blocks quiet (a single "last block" pointer is defeated
- * by every switch), while still re-delivering a genuine change (A → B → A
- * included) and healing a copy that context compaction replaced, once
- * RULES_REDELIVER_MS has passed.
- *
- * Session-scoped, so concurrent sessions never suppress each other. The
- * "no session ⇒ no dedup" fallback is defensive only: this branch already
- * requires a session-provided workspace, so a session object is always present
- * (probed: agent missing / session without cwd → the hook emits nothing). */
-const RULES_REDELIVER_MS = 10 * 60_000
-/** Cap on the per-path ledger so a long session cannot grow it without bound. */
-const RULES_PATH_LEDGER_MAX = 64
 interface RulesDeliveryLedger {
-  lastGlobalHash: string
-  lastGlobalAt: number
-  perPath: Map<string, { hash: string; at: number }>
+  sources: Map<string, string>
 }
 const rulesDeliveries = new WeakMap<object, RulesDeliveryLedger>()
 
-/** Decide and record one rules delivery for a session (see the ledger notes). */
-function rulesDeliveryIsNew(session: unknown, targetRel: string, hash: string): boolean {
-  if (!session || typeof session !== 'object') return true
-  const now = Date.now()
+function ledgerFor(session: object): RulesDeliveryLedger {
   let led = rulesDeliveries.get(session)
   if (!led) {
-    led = { lastGlobalHash: '', lastGlobalAt: 0, perPath: new Map() }
+    led = { sources: new Map() }
     rulesDeliveries.set(session, led)
   }
-  for (const [k, v] of led.perPath) if (now - v.at >= RULES_REDELIVER_MS) led.perPath.delete(k)
-  const pathEntry = led.perPath.get(targetRel)
-  const globalNew = led.lastGlobalHash !== hash || now - led.lastGlobalAt >= RULES_REDELIVER_MS
-  const pathNew = !pathEntry || pathEntry.hash !== hash || now - pathEntry.at >= RULES_REDELIVER_MS
-  if (!globalNew || !pathNew) return false
-  led.lastGlobalHash = hash
-  led.lastGlobalAt = now
-  led.perPath.delete(targetRel) // re-insert last so the cap evicts the oldest path
-  led.perPath.set(targetRel, { hash, at: now })
-  if (led.perPath.size > RULES_PATH_LEDGER_MAX) {
-    const oldest = led.perPath.keys().next().value
-    if (oldest !== undefined) led.perPath.delete(oldest)
+  return led
+}
+
+type RuleIdentity = { name: string; scopeDir: string | null; content: string; sources: string[] }
+function sourceIdentity(e: RuleIdentity): string {
+  return sha256(JSON.stringify({ name: e.name, scopeDir: e.scopeDir, content: e.content }))
+}
+
+function ledgerSkips(led: RulesDeliveryLedger, e: RuleIdentity): boolean {
+  return led.sources.get(e.sources[0]) === sourceIdentity(e)
+}
+
+function recordDelivered(session: object, entries: readonly RuleIdentity[]): void {
+  const led = ledgerFor(session)
+  for (const e of entries) {
+    const source = e.sources[0]
+    if (source) led.sources.set(source, sourceIdentity(e))
   }
-  return true
+}
+
+/** Seed sources actually selected for the once-per-session standing-rules channel. */
+export function markSessionRulesDelivered(session: object, ws: string): void {
+  try {
+    const entries = sessionRules(ws).map((r) => ({
+      name: r.name, scopeDir: r.scopeDir, content: r.content, sources: [r.relPath],
+    }))
+    recordDelivered(session, entries)
+  } catch { /* best-effort; never break the session hook */ }
 }
 
 /** Session-channel standing-rules block cache per workspace (5s TTL). */
@@ -559,28 +549,17 @@ export async function omoPostExecute(
       } catch { /* contained */ }
     }
 
-    // 4) rules-injector: attach the bounded rule context for this path (file
-    //    channel — composed by projectContext: ancestor AGENTS discovery,
-    //    workspace trust boundary, scope/channel gates, 2500-char budget with
-    //    whole-rule granularity and explicit contextIncomplete). Fires after a
-    //    successful `edit` (existing behaviour) and after a successful `read`
-    //    (rules awareness before acting on a file). Delivery is deduped per
-    //    session against both the newest statement and this path's previous
-    //    block (see rulesDeliveryIsNew): an unchanged repeat is suppressed, a
-    //    changed block — A → B → A included — is delivered, and the
-    //    RULES_REDELIVER_MS window re-delivers after the copy was compacted
-    //    away. The fingerprint covers ALL applicable entries (omitted included),
-    //    so a change past the budget cut still re-delivers. No TTL cache: rule
-    //    edits are visible on the very next tool call.
+    // 4) rules-injector: compose only sources whose identity differs from the
+    //    per-session source ledger. Filtering happens before budget packing, so
+    //    already-delivered ancestors cannot crowd out a new local rule.
     if (hookEnabled(cfg, 'rules-injector') && cfg.rulesInjector && (name === 'edit' || name === 'read') && abs) {
       try {
-        const pkg = ruleContextForTargets(ws, [fileRel ?? ''])
-        // Only deliver when there is actual rule content ('' when no rules
-        // apply); never fire for an empty shell.
+        const session = exec.agent?.session
+        const led = session && typeof session === 'object' ? ledgerFor(session) : null
+        const pkg = ruleContextForTargets(ws, [fileRel ?? ''], led ? { skip: (e) => ledgerSkips(led, e) } : {})
         if (pkg.block && pkg.block.trim().length > 0) {
-          if (rulesDeliveryIsNew(exec.agent?.session, fileRel ?? '', pkg.hash)) {
-            extra.push(ctxMessage(pkg.block))
-          }
+          extra.push(ctxMessage(pkg.block))
+          if (led && session && typeof session === 'object') recordDelivered(session, pkg.included)
         }
       } catch { /* contained */ }
     }
