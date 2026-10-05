@@ -7,4 +7,10 @@ lib/
 /.ag*-ws/
 # local scratch: plan drafts written by agent tooling (not part of the package)
 /.zcode/
+# docs are maintained locally only and deliberately NOT published (source-only repo)
+/README.md
+/AGENTS.md
+**/AGENTS.md
+/docs/
+/.agent-notes/
 
