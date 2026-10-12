@@ -62,8 +62,10 @@ export function createUltraPlan(ws: string, goal: string, waves: Wave[], verific
   const plan: UltraPlan = { id, goal, createdAt: nowTs(), phase: 'plan', waves, verification, dir }
   writeJson(omoDir(ws, 'work', 'latest.json'), plan)
   renderPlanMarkdown(ws, plan)
-  // boulder watermark: the cross-session RESUME pointer (start-work mode)
-  setActivePlan(ws, { planId: id, name: slug(goal) || id, total: Math.max(plan.waves.length, 1), completed: 0, status: 'active' })
+  // boulder watermark: the cross-session RESUME pointer (start-work mode); optional like :104/:112
+  try {
+    setActivePlan(ws, { planId: id, name: slug(goal) || id, total: Math.max(plan.waves.length, 1), completed: 0, status: 'active' })
+  } catch { /* boulder optional */ }
   // .omo/plans/<name>.md synced copy (Prometheus WritePlan convention)
   try {
     const plansDir = omoDir(ws, 'plans')

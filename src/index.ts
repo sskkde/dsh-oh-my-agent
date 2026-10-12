@@ -229,8 +229,28 @@ function defaultsSelection(): ModelConfig | undefined {
   } catch { /* ignore */ }
   return undefined
 }
-/** Tool names actually registered this run (filtered by omo.jsonc toggles). */
-let registeredToolNames: string[] = []
+/** Tool names actually registered this run (filtered by omo.jsonc toggles); null = registration not done yet. */
+let registeredToolNames: string[] | null = null
+
+/** omo.jsonc host-wide toggles → tools that should be live (single source of truth for apply() + status). */
+function filterEnabledTools(config: Config): ToolDefinition[] {
+  const machine = loadUserConfig()
+  const disabledTools = new Set(mergedTools(machine))
+  const hashlineOn = mergedToggle(machine, 'hashline_edit', 'enabled', true)
+  const monitorOn = mergedToggle(machine, 'monitor', 'enabled', true)
+  return buildTools(config).filter((t) => {
+    const n = t.name
+    if (disabledTools.has(n)) return false
+    if (!hashlineOn && (n === 'omo_hashline_edit' || n === 'omo_hashline_lines')) return false
+    if (!monitorOn && n === 'omo_monitor') return false
+    return true
+  })
+}
+
+/** Registered tool names; before registration completes, fall back to the enabled set (never the full list). */
+function statusToolNames(config: Config): string[] {
+  return registeredToolNames ?? filterEnabledTools(config).map((t) => String((t as unknown as { name?: string }).name ?? ''))
+}
 /** ctx.skills.register bound at apply() (dynamic SKILL.md loader). */
 let ctxSkillsRegister: (d: unknown) => unknown = () => { /* set in apply */ }
 /** Shared LSP server manager (sessions collide per <ws>::<lang>). */
@@ -329,11 +349,7 @@ export function buildTools(config: Config): ToolDefinition[] {
         return {
           plugin: PLUGIN_ID,
           workspace: ws,
-          tools: [
-            'omo_status', 'omo_rules', 'omo_note', 'omo_hashline_edit', 'omo_hashline_lines',
-            'omo_code_search', 'omo_comment_check', 'omo_monitor', 'omo_ultrawork', 'omo_handoff', 'omo_team_task', 'omo_jsonc', 'omo_codegraph', 'omo_lsp', 'omo_model_route', 'omo_hooks', 'omo_memory',
-            'omo_agents', 'omo_docs', 'omo_look_at', 'omo_skills', 'delegate_as',
-          ],
+          tools: statusToolNames(config),
           rules: { scanned: rules.length, alwaysApply: rules.filter((r) => r.alwaysApply).length },
           counts: b.counts,
           ...(planWm ? { plan: { planId: planWm.planId, name: planWm.name, total: planWm.total, completed: planWm.completed, status: planWm.status } } : {}),
@@ -1608,7 +1624,7 @@ export function buildTools(config: Config): ToolDefinition[] {
         const routes: DelegateRoutes = { provider: config.delegateProvider, flash: config.delegateFlashRoute, heavy: config.delegateHeavyRoute }
         // 子代理会话内禁再派发：只 deny 宿主实际已注册的插件派发工具（restrict 对未知名
         // 响亮失败；宿主具名通道 subagent_* 非本插件注册，交由 nested-delegation-guard 兜底）
-        const denySpawn = registeredToolNames.filter((n) => isDelegationTool(n))
+        const denySpawn = (registeredToolNames ?? []).filter((n) => isDelegationTool(n))
         const spec = res.spec
         const resolved = resolveRoleRoute(res.role, spec, routes, modelCfg)
         const routeStr = `${resolved.provider}/${resolved.model}（${resolved.source}）`
@@ -1899,7 +1915,7 @@ function apiStatus(config: Config): AnyObj {
   return {
     plugin: PLUGIN_ID,
     workspace: ws,
-    tools: registeredToolNames.length > 0 && registeredToolNames.length >= buildTools(config).length - 2 ? registeredToolNames : buildTools(config).map((t) => String((t as unknown as { name?: string }).name ?? '')),
+    tools: statusToolNames(config),
     ts: nowTs(),
     rules: {
       total: rules.length,
@@ -2131,18 +2147,7 @@ export function apply(ctx: Context, config: Config): void {
   ctxSkillsRegister = (d: unknown) => ((ctx as unknown as SkillsCtx).skills).register(d)
 
   // omo.jsonc host-wide toggles (user layer): disabled_tools + feature switches
-  const machine = loadUserConfig()
-  const disabledTools = new Set(mergedTools(machine))
-  const hashlineOn = mergedToggle(machine, 'hashline_edit', 'enabled', true)
-  const monitorOn = mergedToggle(machine, 'monitor', 'enabled', true)
-  const allTools = buildTools(config)
-  const toolsToRegister = allTools.filter((t) => {
-    const n = t.name
-    if (disabledTools.has(n)) return false
-    if (!hashlineOn && (n === 'omo_hashline_edit' || n === 'omo_hashline_lines')) return false
-    if (!monitorOn && n === 'omo_monitor') return false
-    return true
-  })
+  const toolsToRegister = filterEnabledTools(config)
   registeredToolNames = toolsToRegister.map((t) => t.name)
 
   // tools
