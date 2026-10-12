@@ -1,7 +1,10 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
 import { buildPlanReviewQuestion, goalFromPlan, interpretPlanReviewAnswer, validatePlanMarkdown } from '../lib/planReview.js'
-import { bindProjectionHost, isPlanningActive, sessionModeProjectionUnit, setSessionMode, sessionModeOf } from '../lib/sessionModel.js'
+import { bindProjectionHost, isPlanningActive, persistedSessionModeOf, sessionModeProjectionUnit, setSessionMode, sessionModeOf } from '../lib/sessionModel.js'
 
 test('plan review validation and card contract preserve the approved markdown', () => {
   const plan = '# Ship it\n\nFull content.'
@@ -23,6 +26,44 @@ test('session-mode projection replays the persisted event', () => {
   const unit = sessionModeProjectionUnit()
   const state = unit.apply(unit.init(), { type: 'omo/session-mode', data: { mode: 'prometheus' } })
   assert.deepEqual(unit.wire.view(state), { mode: 'prometheus' })
+})
+
+test('mode survives session restoration without custom host events and restores the original model', async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'omo-session-mode-'))
+  const previousHome = process.env.DSH_HOME
+  process.env.DSH_HOME = home
+  const events = []
+  let config = { provider: 'default', model: 'original' }
+  const session = () => ({
+    id: 'session-mode-regression',
+    requestHeader: () => ({ config }),
+    append(type, data) {
+      events.push({ type, data })
+      if (type === 'request/header') config = data.header.config
+    },
+  })
+  try {
+    const initial = { session: session() }
+    await setSessionMode(initial, 'prometheus', { provider: 'plan', model: 'planner' })
+    assert.equal(persistedSessionModeOf('session-mode-regression'), 'prometheus')
+    assert.equal(persistedSessionModeOf('../session-mode-regression'), null)
+    assert.equal(sessionModeOf({ session: session() }), 'prometheus')
+    await setSessionMode({ session: session() }, 'atlas', { provider: 'exec', model: 'executor' })
+    const restored = { session: session() }
+    assert.equal(sessionModeOf(restored), 'atlas')
+    await setSessionMode(restored, 'off')
+    assert.deepEqual(config, { provider: 'default', model: 'original' })
+    bindProjectionHost({ stateOf: () => ({ mode: 'atlas' }) })
+    assert.equal(sessionModeOf({ session: session() }), 'off')
+    assert.equal(persistedSessionModeOf('session-mode-regression'), 'off')
+    assert.ok(events.length > 0)
+    assert.ok(events.every((event) => event.type === 'request/header'))
+  } finally {
+    bindProjectionHost(null)
+    if (previousHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = previousHome
+    fs.rmSync(home, { recursive: true, force: true })
+  }
 })
 
 test('durable projection restores the mode for a restored session, and in-process state wins over a stale one', async () => {

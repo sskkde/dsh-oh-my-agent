@@ -54,7 +54,7 @@ import { docsSearch, docsGet } from './docs.js'
 import { lookAt, LOOK_INTENTS } from './lookAt.js'
 import { registerSkills, listRegistered } from './dynamicSkills.js'
 import { omoPreExecute, omoPostExecute, hooksStatus, nestedDelegationGuard, registerPerAgentGuard, isDelegationTool, hooksConfigFor, sessionRulesBlockFor, markSessionRulesDelivered, type ExecLike, type HooksConfig } from './hooks.js'
-import { roleModelRoute, prometheusPlanRoute, sessionModeIntentOf, setSessionMode, sessionModeOf, sessionModeProjectionUnit, bindProjectionHost, type SessionMode, type ModelConfig } from './sessionModel.js'
+import { roleModelRoute, prometheusPlanRoute, sessionModeIntentOf, setSessionMode, sessionModeOf, persistedSessionModeOf, sessionModeProjectionUnit, bindProjectionHost, type SessionMode, type ModelConfig } from './sessionModel.js'
 import { buildPlanReviewQuestion, goalFromPlan, interpretPlanReviewAnswer, validatePlanMarkdown } from './planReview.js'
 import { ATLAS_SECTION } from './atlasPrompt.js'
 import { OMO_MESSAGE_KIND } from './messageSource.js'
@@ -2203,7 +2203,10 @@ export function apply(ctx: Context, config: Config): void {
     regOnce(ctx, () => regRoute({
       kind: 'exact',
       path: '/dsh-oh-my-agent/api/status',
-      handler: h((_req, res) => json(res, apiStatus(config))),
+      handler: h((req, res) => {
+        const id = new URL((req as { url?: string }).url || '/', 'http://localhost').searchParams.get('sessionId')
+        json(res, id ? { ok: true, sessionMode: persistedSessionModeOf(id) } : apiStatus(config))
+      }),
     }), 'dsh-oh-my-agent: api/status')
 
     regOnce(ctx, () => regRoute({

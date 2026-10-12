@@ -27,10 +27,14 @@
  *   工具 execute）都在 turn 内，满足约束；仍对追加失败做防御（ok:false，不静默）。
  * - 生效时序与官方 `session.selectModel` 同语义：**从切换后的下一次请求生效**。
  * - 不写 settings 全局默认（那是 apiproxy selectModel 的行为），粒度=当前会话。
- * - 模式通过 omo/session-mode 事件持久化并由 omo-session-mode 投影读取；WeakMap 仅作投影不可读时的兼容回退。
+ * - 模式写入独立的会话状态文件；旧 omo/session-mode 事件仍由投影读取。
+ *   rc.2 的 append 不支持 ignorable 标记，不能继续向宿主日志写自定义事件。
  */
 
 import { z } from 'zod'
+import path from 'node:path'
+import { homedir } from 'node:os'
+import { readJson, writeJson } from './util.js'
 import { findRole, type AgentRole } from './agents.js'
 import { resolveRoleRoute, DEFAULT_ROUTES, type DelegateRoutes } from './delegate.js'
 
@@ -116,6 +120,7 @@ interface SessionModeState {
 const states = new WeakMap<object, SessionModeState>()
 
 interface SessionLike {
+  id?: string
   append(type: string, data: AnyObj, opts?: AnyObj): unknown
   requestHeader(): { config?: { provider?: string; model?: string; reasoningEffort?: string } } | undefined
 }
@@ -141,9 +146,31 @@ function sameRoute(a: ModelConfig | null, b: ModelConfig | null): boolean {
   return a.provider === b.provider && a.model === b.model
 }
 
-/** Durable mode event is additive: a failed append keeps the in-process state authoritative. */
-function appendModeEvent(session: SessionLike, mode: SessionMode): boolean {
-  try { session.append(SESSION_MODE_EVENT, { mode }); return true } catch { return false }
+function modeStateFile(session: SessionLike): string | null {
+  if (typeof session.id !== 'string' || !/^[a-zA-Z0-9_-]+$/.test(session.id)) return null
+  const home = process.env.DSH_HOME || path.join(homedir(), '.dsh')
+  return path.join(home, 'dsh-oh-my-agent', 'session-modes', session.id + '.json')
+}
+
+function readModeState(session: SessionLike): SessionModeState | null {
+  const file = modeStateFile(session)
+  const stored = file ? readJson<SessionModeState>(file) : null
+  if (!stored || !['off', 'prometheus', 'atlas'].includes(stored.mode)) return null
+  const pre = stored.pre === null ? null : readConfig({ config: stored.pre })
+  if (stored.pre !== null && !pre) return null
+  return { mode: stored.mode, pre }
+}
+
+/** Read-only client status; absence lets older sessions use their legacy projection. */
+export function persistedSessionModeOf(id: string): SessionMode | null {
+  return readModeState({ id } as SessionLike)?.mode ?? null
+}
+
+/** Keep plugin state outside the host's closed event vocabulary, with atomic writes. */
+function persistModeState(session: SessionLike, state: SessionModeState): boolean {
+  const file = modeStateFile(session)
+  if (!file) return false
+  try { writeJson(file, state); return true } catch { return false }
 }
 
 /** 当前会话模式（无状态视为 off）。 */
@@ -153,6 +180,8 @@ export function sessionModeOf(agent: unknown): SessionMode {
   // In-process state wins: it is also the only record when the durable append failed.
   const local = states.get(s)?.mode
   if (local !== undefined) return local
+  const stored = readModeState(s)
+  if (stored) return stored.mode
   // No in-process state (fresh process / restored session) -> read the durable projection.
   // Any absent, malformed or throwing read keeps the pre-projection behavior (off).
   try {
@@ -192,7 +221,7 @@ export async function setSessionMode(
 ): Promise<SessionSwitchResult> {
   const s = sessionOf(agent)
   if (!s) return { ok: false, reason: '无会话上下文（agent.session 不可用）' }
-  const prev = states.get(s)
+  const prev = states.get(s) ?? readModeState(s)
   const currentMode = sessionModeOf(agent)
 
   if (mode === 'off') {
@@ -209,9 +238,8 @@ export async function setSessionMode(
         return { ok: false, reason: `还原会话模型失败（request/header 追加被拒）：${String(e)}` }
       }
     }
-    // Only drop the in-process record when the durable 'off' event landed; otherwise
-    // the projection would still replay the previous mode after a restart.
-    if (appendModeEvent(s, 'off')) states.delete(s)
+    // Persist off explicitly so an old projection cannot reactivate a previous mode.
+    if (persistModeState(s, { mode: 'off', pre: null })) states.delete(s)
     else states.set(s, { mode: 'off', pre: prev?.pre ?? null })
     return { ok: true, mode: 'off', route: revert }
   }
@@ -229,7 +257,7 @@ export async function setSessionMode(
     }
   }
   states.set(s, { mode, pre })
-  appendModeEvent(s, mode)
+  persistModeState(s, { mode, pre })
   return { ok: true, mode, route }
 }
 

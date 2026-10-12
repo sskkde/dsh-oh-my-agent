@@ -31,7 +31,18 @@ type ClientContext = {
   }
 }
 
-export const inject = ['slots']
+/**
+ * Service gate of the composer write path. Both entries are load-bearing and
+ * were measured on a live web client (2026-10-07), not inferred:
+ *   - without `remote`          → `cannot get property "remote" without inject`
+ *   - without `remote.commands` → `cannot get property "remote.commands" without inject`
+ * The namespace is its own service (a sibling fiber mounts `remote.<ns>`), so
+ * declaring the parent is not enough. The refusal is thrown when the selector
+ * evaluates `ctx.remote.commands.execute(...)` on click; swallowed by its own
+ * `.catch`, it made the control look dead. Mirrors `dsh-client-ui-commands` /
+ * `dsh-travel` (`static inject = [..., "remote", "remote.commands"]`).
+ */
+export const inject = ['slots', 'remote', 'remote.commands']
 
 /** Host status payload (mirrors src/index.ts apiStatus). */
 interface OmOStatus {
@@ -424,6 +435,7 @@ const MODE_CSS = [
   '.omoMode_triggerIcon{flex:none;display:inline-flex}',
   '.omoMode_triggerIcon svg{width:14px;height:14px}',
   '.omoMode_triggerLabel{text-overflow:ellipsis;white-space:nowrap;min-width:0;overflow:hidden}',
+  '.omoMode_badge{color:var(--dsw-alias-label-tertiary);letter-spacing:.2px;flex:none;align-self:flex-start;margin-top:-1px;font-size:8px;font-weight:600;line-height:10px}',
   '.omoMode_chevron{color:var(--dsw-alias-label-caption);flex:none;transition:transform .12s;display:inline-flex}',
   '.omoMode_chevronOpen{transform:rotate(180deg)}',
   '@container (width<=460px){.omoMode_trigger:has(.omoMode_triggerIcon) .omoMode_triggerLabel{display:none}}',
@@ -449,6 +461,21 @@ type ModeSelectProps = {
 }
 
 /**
+ * Read one `commands.execute` RemoteResult without trusting its shape.
+ * A rejected RPC, a refused call and a handler-level error all have to reach
+ * the caller: an unanswered switch must never look like a no-op again.
+ */
+function commandFailure(result: unknown): string {
+  const envelope = result as { ok?: boolean; error?: { message?: string }; value?: { result?: { kind?: string; text?: string } } } | null | undefined
+  if (envelope === null || envelope === undefined) return '命令未被执行（宿主无响应）'
+  if (envelope.ok === false) return envelope.error?.message ?? '命令调用被拒绝'
+  if (envelope.value === undefined) return '命令未被识别（/omo-mode 未注册）'
+  const outcome = envelope.value?.result
+  if (outcome?.kind === 'error') return outcome.text ?? '命令执行失败'
+  return ''
+}
+
+/**
  * Composer session-mode selector, styled and structured like the native
  * permission select next to it (trigger + anchored `Menu` from ui-primitives).
  * An unavailable projection degrades to a disabled label that writes nothing.
@@ -457,6 +484,27 @@ export function ModeSelect(props: ModeSelectProps): unknown {
   const [open, setOpen] = useState(false)
   const [busy, setBusy] = useState(false)
   const [writeError, setWriteError] = useState('')
+  const [storedMode, setStoredMode] = useState<{ sessionId: string; mode: SessionMode } | null>(null)
+  useEffect(() => {
+    const sessionId = props.sessionId
+    if (!sessionId) return
+    let active = true
+    let pending = false
+    const refresh = (): void => {
+      if (pending) return
+      pending = true
+      void apiGet('/dsh-oh-my-agent/api/status?sessionId=' + encodeURIComponent(sessionId))
+        .then((value) => {
+          const mode = (value as { sessionMode?: SessionMode })?.sessionMode
+          if (active && mode && SESSION_MODE_ROLE[mode]) setStoredMode({ sessionId, mode })
+        })
+        .catch(() => {})
+        .then(() => { pending = false })
+    }
+    refresh()
+    const timer = setInterval(refresh, 1500)
+    return () => { active = false; clearInterval(timer) }
+  }, [props.sessionId, busy])
   const projectionHook = props.useProjection
   let projection: { mode?: SessionMode } | undefined
   let projectionFailed = !projectionHook
@@ -467,8 +515,9 @@ export function ModeSelect(props: ModeSelectProps): unknown {
       projectionFailed = true
     }
   }
-  const mode = projection?.mode
-  if (projectionFailed || mode === undefined || SESSION_MODE_ROLE[mode] === undefined) {
+  const persistedMode = storedMode?.sessionId === props.sessionId ? storedMode?.mode : undefined
+  const mode = persistedMode ?? projection?.mode
+  if ((projectionFailed && persistedMode === undefined) || mode === undefined || SESSION_MODE_ROLE[mode] === undefined) {
     return createElement('button', {
       type: 'button',
       className: 'omoMode_trigger',
@@ -487,6 +536,10 @@ export function ModeSelect(props: ModeSelectProps): unknown {
     setBusy(true)
     void Promise.resolve()
       .then(() => props.select!(next.command))
+      .then((result) => {
+        const failure = commandFailure(result)
+        if (failure !== '') { setWriteError(failure); console.error('[dsh-oh-my-agent] /omo-mode ' + next.command + ': ' + failure) }
+      })
       .catch((error: unknown) => { setWriteError(String((error as Error)?.message ?? error)) })
       .then(() => { setBusy(false) })
   }
@@ -503,6 +556,7 @@ export function ModeSelect(props: ModeSelectProps): unknown {
   },
     createElement('span', { className: 'omoMode_triggerIcon', 'aria-hidden': true }, SESSION_MODE_GLYPH[mode]),
     createElement('span', { className: 'omoMode_triggerLabel' }, current.role),
+    writeError !== '' && createElement('sup', { className: 'omoMode_badge', 'aria-hidden': true }, '!'),
     createElement('span', { className: 'omoMode_chevron' + (open ? ' omoMode_chevronOpen' : ''), 'aria-hidden': true },
       createElement(IconChevronDownOutlineRegular, {})))
 
