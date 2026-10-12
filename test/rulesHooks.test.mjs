@@ -5,6 +5,8 @@
  *   - 成功 read 在后置上下文附局部规则（祖先命中、兄弟隔离）；成功 edit 保留注入行为
  *   - 失败 read/edit 不伪称已交付；hook disabled 不注入；缺 workspace 不猜 cwd
  *   - 会话级交付账本：同块重复静默、规则变更（A→B→A）重投、会话隔离、无 TTL 缓存
+ *   - 块指纹门：全部规则超预算（included 为空）时 notice 块每会话只投一次，来源变化仍重投（D1）
+ *   - 账本按 session id 键控：跨轮换包装对象不重投、跨会话隔离；session 通道标记同源（D3，含 apply 注册的 listener 级）
  *   - omo_agents brief 经同一 context 组合（buildTools 捕获实际 prompt）：files 局部范围不提升为全局
  *   - handoff 带知识职责导航与「docs/notes 未自动收集」声明，旧参数语义保留
  */
@@ -13,7 +15,7 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { omoPostExecute, markSessionRulesDelivered } from '../lib/hooks.js'
+import { omoPostExecute, markSessionRulesDelivered, sessionRulesSent, markSessionRulesSent, sessionKeyOf } from '../lib/hooks.js'
 import { buildTools, apply } from '../lib/index.js'
 import { buildHandoff } from '../lib/handoff.js'
 import { ruleContextForTargets } from '../lib/projectContext.js'
@@ -285,4 +287,90 @@ test('brief 上下文与 hook 上下文同源：同一组合函数输出一致',
   assert.match(brief, /ROOT_RULE_MARK/)
   const decision = await post('read', 'src/module/sample.txt', { session: { header: { cwd: ws } } })
   assert.match(allText(decision), /ROOT_RULE_MARK/)
+})
+
+/* ── 2026-10-12：投递账本两处修补（D1 纯 notice 块重复 / D3 对象身份键控）── */
+
+test('D1：全部规则超预算时 notice 块每会话只投一次，来源变化仍重投', async () => {
+  put('AGENTS.md', rule('ROOT_BIG', 'R'.repeat(6400)))
+  put('src/AGENTS.md', rule('SUB_BIG', 'S'.repeat(6400)))
+  put('src/a.txt', 'A')
+  const s = { header: { id: 'S-notice-once', cwd: ws } }
+  const first = await post('read', 'src/a.txt', { session: s })
+  assert.match(allText(first), /contextIncomplete/, 'over-budget rules must surface the incomplete notice')
+  assert.ok(!allText(first).includes('R'.repeat(200)), 'no rule body fits the budget')
+  const repeat = await post('read', 'src/a.txt', { session: s })
+  assert.equal(allText(repeat), '', 'notice-only block must not repeat within a session')
+  const third = await post('read', 'src/a.txt', { session: s })
+  assert.equal(allText(third), '', 'still silent on the third read')
+  put('src/AGENTS.md', rule('SUB_BIG', 'S'.repeat(6401)))
+  const changed = await post('read', 'src/a.txt', { session: s })
+  assert.match(allText(changed), /contextIncomplete/, 'a changed source must re-deliver the block')
+})
+
+test('D3：账本按 session id 复用——跨轮换对象不重投，跨会话隔离', async () => {
+  const s1 = { header: { id: 'S-turn-shared', cwd: ws } }
+  const first = await post('read', 'src/module/sample.txt', { session: s1 })
+  assert.match(allText(first), /MODULE_RULE_MARK/)
+  const s2 = { header: { id: 'S-turn-shared', cwd: ws } } // 同一会话的下一轮：新的包装对象
+  const second = await post('read', 'src/module/sample.txt', { session: s2 })
+  assert.equal(allText(second), '', 'same session id must share the ledger across wrapper objects')
+  const other = { header: { id: 'S-turn-other', cwd: ws } }
+  const third = await post('read', 'src/module/sample.txt', { session: other })
+  assert.match(allText(third), /MODULE_RULE_MARK/, 'a different session id must not inherit the ledger')
+})
+
+test('D3：session 通道标记按 session id 跨对象保持', () => {
+  const a = { header: { id: 'S-chan-a', cwd: ws } }
+  const b = { header: { id: 'S-chan-a', cwd: ws } }
+  const c = { header: { id: 'S-chan-b', cwd: ws } }
+  assert.equal(sessionKeyOf(a), 'S-chan-a')
+  assert.equal(sessionKeyOf(a.header), 'S-chan-a', 'Session.id mirrors header.id')
+  assert.equal(sessionKeyOf({ header: { cwd: ws } }), null, 'no id ⇒ object-identity fallback')
+  assert.equal(sessionRulesSent(a), false)
+  markSessionRulesSent(a)
+  assert.equal(sessionRulesSent(b), true, 'same id ⇒ already sent')
+  assert.equal(sessionRulesSent({ header: { id: 'S-chan-a', cwd: ws } }), true, 'a third wrapper object still sees it')
+  assert.equal(sessionRulesSent(c), false, 'different session ⇒ independent')
+  assert.equal(sessionRulesSent({ header: { cwd: ws } }), false, 'no id ⇒ fresh object, not marked')
+})
+
+test('D3（listener 级）：apply 注册的 session 通道跨轮换对象只注入一次', async () => {
+  put('AGENTS.md', rule('SESSION_RULE_MARK', 'standing body', 'alwaysApply: true\napplyTo: [session]\n'))
+  const handlers = new Map()
+  const disposers = []
+  const ctx = {
+    inject: (_deps, callback) => callback({}),
+    effect: (callback) => { const dispose = callback(); if (typeof dispose === 'function') disposers.push(dispose) },
+    get: () => undefined,
+    tools: { register: () => {}, guard: () => () => {} },
+    skills: { register: () => () => {} },
+    on: (event, handler) => { const list = handlers.get(event) ?? []; list.push(handler); handlers.set(event, list); return () => {} },
+    logger: { info: () => {}, warn: () => {} },
+  }
+  apply(ctx, {
+    defaultWorkspace: ws, workspaceHints: [], delegateProvider: 'spawn',
+    delegateFlashRoute: 'f/x', delegateHeavyRoute: 'h/y', mainPrompt: 'off',
+    customPromptSection: '', goalGuardOn: false,
+  })
+  try {
+    const list = handlers.get('agent/pre-step') ?? []
+    assert.ok(list.length >= 1, 'apply must register the pre-step listeners')
+    // cordis waterfall: listeners run in order, each receiving `next`
+    // (the host's base decision always carries `messages`, see agent/pre-step)
+    const runPre = (session) => list
+      .reduceRight((next, fn) => () => fn({ agent: { session } }, next), async () => ({ kind: 'accept', messages: [] }))()
+    const s1 = { header: { id: 'S-listener-shared', cwd: ws } }
+    const d1 = await runPre(s1)
+    const first = (d1.messages ?? []).filter((m) => JSON.stringify(m).includes('SESSION_RULE_MARK'))
+    assert.equal(first.length, 1, 'first pre-step injects the standing rules once')
+    const s2 = { header: { id: 'S-listener-shared', cwd: ws } } // 下一轮：新的包装对象，同一会话
+    const d2 = await runPre(s2)
+    assert.equal((d2.messages ?? []).length, 0, 'a new wrapper object for the same session must not re-inject')
+    const d3 = await runPre({ header: { id: 'S-listener-other', cwd: ws } })
+    const other = (d3.messages ?? []).filter((m) => JSON.stringify(m).includes('SESSION_RULE_MARK'))
+    assert.equal(other.length, 1, 'a different session id injects independently')
+  } finally {
+    for (const dispose of disposers.reverse()) dispose()
+  }
 })

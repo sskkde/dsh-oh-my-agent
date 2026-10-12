@@ -53,7 +53,7 @@ import { resolveChannel, composeDelegationPrompt, getSubagentsService, runDelega
 import { docsSearch, docsGet } from './docs.js'
 import { lookAt, LOOK_INTENTS } from './lookAt.js'
 import { registerSkills, listRegistered } from './dynamicSkills.js'
-import { omoPreExecute, omoPostExecute, hooksStatus, nestedDelegationGuard, registerPerAgentGuard, isDelegationTool, hooksConfigFor, sessionRulesBlockFor, markSessionRulesDelivered, type ExecLike, type HooksConfig } from './hooks.js'
+import { omoPreExecute, omoPostExecute, hooksStatus, nestedDelegationGuard, registerPerAgentGuard, isDelegationTool, hooksConfigFor, sessionRulesBlockFor, markSessionRulesDelivered, sessionRulesSent, markSessionRulesSent, type ExecLike, type HooksConfig } from './hooks.js'
 import { roleModelRoute, prometheusPlanRoute, sessionModeIntentOf, setSessionMode, sessionModeOf, persistedSessionModeOf, sessionModeProjectionUnit, bindProjectionHost, type SessionMode, type ModelConfig } from './sessionModel.js'
 import { buildPlanReviewQuestion, goalFromPlan, interpretPlanReviewAnswer, validatePlanMarkdown } from './planReview.js'
 import { ATLAS_SECTION } from './atlasPrompt.js'
@@ -2650,9 +2650,10 @@ export function apply(ctx: Context, config: Config): void {
   // rules session channel：会话第一步把「常设守则」（alwaysApply 且 applyTo 含
   // 'session'，如 plugin-test-env.mdc 的 [session, tool] 铁律）注入一次。
   // 与 file 通道（edit 按路径注入）互斥：通道门保证 [session, tool] 规则不再进
-  // edit 后置注入，只在本通道每会话出现一次（WeakSet 按 session 对象去重，
-  // 会话销毁自动回收；同一会话规则中途变更不重复注入）。
-  const sessionRulesNotified = new WeakSet<object>()
+  // edit 后置注入，只在本通道每会话出现一次。去重标记与 file 通道共用同一份
+  // 会话账本（hooks.ts），按 session id 键控——agent/session 包装对象逐轮重建
+  // 或 preset scope 重挂载都不会重置它（2026-10-12 前是 apply() 内的 WeakSet，
+  // 键为对象身份，实测每轮重注入）。规则中途变更同样不重注入。
   ctx.effect(() => {
     const anyCtx = ctx as unknown as { on: (ev: string, fn: unknown) => (() => void) | undefined }
     const g = anyCtx.on('agent/pre-step', async (payload: unknown, next: unknown) => {
@@ -2671,10 +2672,10 @@ export function apply(ctx: Context, config: Config): void {
         } catch {
           return decision
         }
-        if (sessionRulesNotified.has(session)) return decision
+        if (sessionRulesSent(session)) return decision
         const block = sessionRulesBlockFor(ws)
         if (!block || !block.trim()) return decision
-        sessionRulesNotified.add(session)
+        markSessionRulesSent(session)
         markSessionRulesDelivered(session, ws)
         const notice = createUserMessage({
           content: [{ type: 'text', text: `[OMO HOOK · rules · session] 会话常设守则（每次会话注入一次，请遵守）：\n${block.slice(0, 2500)}` }],

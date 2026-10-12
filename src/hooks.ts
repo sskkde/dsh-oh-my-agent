@@ -276,17 +276,71 @@ const recentReads = new Map<string, number>()
  * entirely the delivery ledger below. */
 
 interface RulesDeliveryLedger {
+  /** Per-source identity of the last successful delivery (see sourceIdentity). */
   sources: Map<string, string>
+  /** Composed-block fingerprint per normalized target set (file channel). */
+  blocks: Map<string, string>
+  /** Session-channel standing-rules block already injected for this session. */
+  sessionRules?: boolean
 }
-const rulesDeliveries = new WeakMap<object, RulesDeliveryLedger>()
+
+/** Sessions kept by id before the oldest ledger is dropped (bounded memory). */
+const LEDGER_LIMIT = 64
+
+/** Ledgers keyed by stable session id. An agent/session wrapper re-created in a
+ * later turn — or a re-mounted preset scope — must hit the same ledger, so
+ * object identity is only the fallback for sessions that carry no id. */
+const ledgersById = new Map<string, RulesDeliveryLedger>()
+const ledgersByObject = new WeakMap<object, RulesDeliveryLedger>()
+
+/** Stable session identity (`header.id` mirrors the Session's own id). */
+export function sessionKeyOf(session: unknown): string | null {
+  if (!session || typeof session !== 'object') return null
+  const s = session as { id?: unknown; header?: { id?: unknown } }
+  const id = s.header?.id ?? s.id
+  return typeof id === 'string' && id.length > 0 ? id : null
+}
+
+function newLedger(): RulesDeliveryLedger {
+  return { sources: new Map(), blocks: new Map() }
+}
 
 function ledgerFor(session: object): RulesDeliveryLedger {
-  let led = rulesDeliveries.get(session)
+  const key = sessionKeyOf(session)
+  if (key) {
+    let led = ledgersById.get(key)
+    if (!led) {
+      led = newLedger()
+      ledgersById.set(key, led)
+      if (ledgersById.size > LEDGER_LIMIT) {
+        const oldest = ledgersById.keys().next().value
+        if (oldest !== undefined && oldest !== key) ledgersById.delete(oldest)
+      }
+    }
+    return led
+  }
+  let led = ledgersByObject.get(session)
   if (!led) {
-    led = { sources: new Map() }
-    rulesDeliveries.set(session, led)
+    led = newLedger()
+    ledgersByObject.set(session, led)
   }
   return led
+}
+
+/** Ledger key for one composed block: the normalized target set it was built for. */
+function blockKeyOf(targets: readonly string[]): string {
+  return targets.join('|')
+}
+
+/** True when the identical composed block was already delivered this session.
+ * A block made of the header + contextIncomplete notice has an empty `included`
+ * list, so the per-source ledger alone cannot dedupe it. */
+function blockDelivered(led: RulesDeliveryLedger, targets: readonly string[], hash: string): boolean {
+  return led.blocks.get(blockKeyOf(targets)) === hash
+}
+
+function recordBlockDelivered(led: RulesDeliveryLedger, targets: readonly string[], hash: string): void {
+  led.blocks.set(blockKeyOf(targets), hash)
 }
 
 type RuleIdentity = { name: string; scopeDir: string | null; content: string; sources: string[] }
@@ -314,6 +368,18 @@ export function markSessionRulesDelivered(session: object, ws: string): void {
     }))
     recordDelivered(session, entries)
   } catch { /* best-effort; never break the session hook */ }
+}
+
+/** Whether the standing-rules (session channel) block was already injected for
+ * this session. Strictly once per session: rule edits mid-session do not
+ * re-inject. Keyed by session id, so a per-turn wrapper object cannot reset it. */
+export function sessionRulesSent(session: object): boolean {
+  return ledgerFor(session).sessionRules === true
+}
+
+/** Mark the session-channel standing-rules block as injected for this session. */
+export function markSessionRulesSent(session: object): void {
+  ledgerFor(session).sessionRules = true
 }
 
 /** Session-channel standing-rules block cache per workspace (5s TTL). */
@@ -551,15 +617,23 @@ export async function omoPostExecute(
 
     // 4) rules-injector: compose only sources whose identity differs from the
     //    per-session source ledger. Filtering happens before budget packing, so
-    //    already-delivered ancestors cannot crowd out a new local rule.
+    //    already-delivered ancestors cannot crowd out a new local rule. A second
+    //    guard records the composed block itself: when every applicable rule is
+    //    over budget the block carries only the contextIncomplete notice and
+    //    `included` stays empty, so the source ledger alone would re-send the
+    //    same notice on every read/edit of that path.
     if (hookEnabled(cfg, 'rules-injector') && cfg.rulesInjector && (name === 'edit' || name === 'read') && abs) {
       try {
         const session = exec.agent?.session
         const led = session && typeof session === 'object' ? ledgerFor(session) : null
         const pkg = ruleContextForTargets(ws, [fileRel ?? ''], led ? { skip: (e) => ledgerSkips(led, e) } : {})
-        if (pkg.block && pkg.block.trim().length > 0) {
+        const fresh = pkg.block.trim().length > 0 && (led === null || !blockDelivered(led, pkg.targets, pkg.hash))
+        if (fresh) {
           extra.push(ctxMessage(pkg.block))
-          if (led && session && typeof session === 'object') recordDelivered(session, pkg.included)
+          if (led && session && typeof session === 'object') {
+            recordBlockDelivered(led, pkg.targets, pkg.hash)
+            recordDelivered(session, pkg.included)
+          }
         }
       } catch { /* contained */ }
     }
