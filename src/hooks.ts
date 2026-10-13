@@ -68,6 +68,7 @@ import { ruleContextForTargets } from './projectContext.js'
 import { checkComments } from './commentCheck.js'
 import { MonitorRegistry } from './monitor.js'
 import { isPlanningActive } from './sessionModel.js'
+import { OMO_MESSAGE_KIND } from './messageSource.js'
 
 export interface HookEvent {
   ts: string
@@ -408,7 +409,7 @@ export function sessionRulesBlockFor(ws: string): string {
 /** Build a user-role context message for attachment. */
 function ctxMessage(text: string): unknown {
   return createUserMessage({
-    source: { kind: 'user' },
+    source: { kind: OMO_MESSAGE_KIND, form: 'notice', summary: text.slice(0, 160) },
     content: [{ type: 'text', text }],
   })
 }
