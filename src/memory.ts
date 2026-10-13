@@ -424,3 +424,16 @@ export function memoryStatus(ws: string, execWsHint?: string): MemoryStatus & { 
     fileList: files.map((f) => ({ name: f.name, description: f.description, readOnly: f.readOnly })),
   }
 }
+
+/** Shared backend-aware memory ownership instructions for prompts and handoff. */
+export function memoryResponsibilityText(backend: 'local' | 'openviking' = 'local'): string {
+  return backend === 'openviking'
+    ? '跨会话记忆（经验、偏好、历史结论）经 omo_memory 存入 OpenViking 精确 scope；本地 .omo/ 仅保存运行态（计划、boulder、团队任务、监控）。仓库内文档分层与决策正文/证据（如 .agent-notes/notes/）遵循工作区自身规则，插件不覆盖或禁止。远端不可用即失败关闭；精确 scope CRUD 不代表 recallPeerScope=all 已变为项目精准召回；无自动数据迁移。'
+    : '跨会话记忆（经验、偏好、历史结论）使用 omo_memory 本地库；决策正文与证据（如 .agent-notes/notes/）遵循工作区自身规则。运行态计划、boulder、团队任务与监控保存在 .omo/。'
+
+}
+
+/** Keep mainPrompt=off truly disabled while reusing the same responsibility text. */
+export function withMemoryResponsibility(base: string, backend: 'local' | 'openviking'): string {
+  return base.trim() ? `${base}\n\n## Persistent memory ownership\n${memoryResponsibilityText(backend)}` : ''
+}

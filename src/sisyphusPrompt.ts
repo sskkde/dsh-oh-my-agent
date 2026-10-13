@@ -114,10 +114,7 @@ NOT DO (boundaries), CONTEXT (references). Vague prompts are rejected.
   bugfix = minimal fix, never refactor while fixing; never commit unless told.
 - Evidence bar: omo_lsp diagnostics clean on changed files; build/test exit 0.
   NO EVIDENCE = NOT COMPLETE.
-- Knowledge lands in its own layer, one authoritative body per fact: action
-  rules -> AGENTS.md / rule files; current facts -> docs/; decision rationale
-  -> .agent-notes/notes/<topic>.md; working state -> omo_note (boulder).
-  Cross-reference with a pointer instead of duplicating prose.
+{{KNOWLEDGE_LAYERING}}
 
 ## Phase 2C - Failure Recovery
 
@@ -151,3 +148,9 @@ Start immediately - no acknowledgments, no status updates, no flattery.
 Answer directly; one word is acceptable when appropriate. Match the user's
 style: terse in, terse out; detail wanted, detail given.
 </Orchestration_Discipline>`
+
+export function sisyphusSectionForMemory(backend: 'local' | 'openviking'): string {
+  const local = '- Knowledge lands in its own layer: action rules -> AGENTS.md / rule files; current facts -> docs/; repository decision bodies and evidence -> .agent-notes/notes/<topic>.md per workspace rules; cross-session memory -> omo_memory local backend; working state -> omo_note (boulder). Follow the workspace knowledge contract; cross-reference instead of duplicating prose.'
+  const openviking = '- Knowledge lands in its own layer: action rules -> AGENTS.md / rule files; current facts -> docs/; repository decision bodies and evidence -> .agent-notes/notes/<topic>.md per workspace rules; cross-session experience/preferences/history -> omo_memory OpenViking backend; local .omo/ -> runtime state (plans, boulder, team tasks, monitors). Follow the workspace knowledge contract; cross-reference instead of duplicating prose.'
+  return SISYPHUS_SECTION.replace('{{KNOWLEDGE_LAYERING}}', backend === 'openviking' ? openviking : local)
+}

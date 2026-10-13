@@ -4,6 +4,7 @@
  */
 
 import type { SkillRegistration } from '@deepseek-ai/dsh-skill'
+import { memoryResponsibilityText } from './memory.js'
 
 const ULTRAWORK: SkillRegistration = {
   name: 'omo-ultrawork',
@@ -194,8 +195,16 @@ Keep every handoff self-contained: never rely on the receiving agent knowing
 what happened before.`,
 }
 
-export function skillRegistrations(): SkillRegistration[] {
-  return [ULTRAWORK, START_WORK, RULES, HANDOFF_SKILL, HYPERPLAN, REFACTOR, REMOVE_AI_SLOPS, SUBAGENT_ROLES, DELIVER, MODEL_ROUTING, MEMORY, DEBUGGING, REVIEW_WORK, ULW_PLAN, INIT_DEEP, GIT_MASTER, SISYPHUS_RETURN, CANCEL_ULTRAWORK]
+export function skillRegistrations(backend: 'local' | 'openviking' = 'local'): SkillRegistration[] {
+  if (backend === 'local') return [ULTRAWORK, START_WORK, RULES, HANDOFF_SKILL, HYPERPLAN, REFACTOR, REMOVE_AI_SLOPS, SUBAGENT_ROLES, DELIVER, MODEL_ROUTING, MEMORY, DEBUGGING, REVIEW_WORK, ULW_PLAN, INIT_DEEP, GIT_MASTER, SISYPHUS_RETURN, CANCEL_ULTRAWORK]
+  const memory: SkillRegistration = {
+    ...MEMORY,
+    description: 'OpenViking 远端精确 scope 记忆；不启用本地自动循环。',
+    content: `# omo-memory — OpenViking adapter\n\n${memoryResponsibilityText(backend)}\n\n经 omo_memory 访问。支持 status/list/create/put/read/str_replace/insert（old_text 唯一正文锚点）/delete/update_description/search/compile/journal；rename、reflect、extract 不支持。journal 是按当前 binding 过滤的 adapter-local 进程日志，不是服务端事务或 Git。list/compile 保留嵌套路径且描述/read_only 元数据未知；按 name 执行的 CRUD 只针对根级记忆文件。\n\n精确 scope CRUD 不代表 recallPeerScope=all 会变成项目精准召回；没有自动数据迁移。`,
+
+  }
+  const handoff: SkillRegistration = { ...HANDOFF_SKILL, content: `${HANDOFF_SKILL.content}\n\n## Persistent memory scope\n${memoryResponsibilityText(backend)}` }
+  return [ULTRAWORK, START_WORK, RULES, handoff, HYPERPLAN, REFACTOR, REMOVE_AI_SLOPS, SUBAGENT_ROLES, DELIVER, MODEL_ROUTING, memory, DEBUGGING, REVIEW_WORK, ULW_PLAN, INIT_DEEP, GIT_MASTER, SISYPHUS_RETURN, CANCEL_ULTRAWORK]
 }
 
 const CANCEL_ULTRAWORK: SkillRegistration = {

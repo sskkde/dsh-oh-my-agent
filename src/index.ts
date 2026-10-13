@@ -38,7 +38,7 @@ import z from 'schemastery'
 import path from 'node:path'
 import { readFile } from 'node:fs/promises'
 import { existsSync, readdirSync } from 'node:fs'
-import { text, PLUGIN_ID, ensureDir, resolveWorkspace, nowTs, omoDir, stripUndefined, writeState } from './util.js'
+import { text, PLUGIN_ID, ensureDir, resolveWorkspace, nowTs, omoDir, stripUndefined, writeState, sha256 } from './util.js'
 import { scanRules, refreshRulesState } from './rules.js'
 import { ruleContextForTargets } from './projectContext.js'
 import { boulderSummary, listNotes, appendNote, updateNote, newThreadBoulder, checkpointBoulder, isSection, SECTIONS, loadBoulder, saveBoulder } from './boulder.js'
@@ -59,15 +59,17 @@ import { buildPlanReviewQuestion, goalFromPlan, interpretPlanReviewAnswer, valid
 import { ATLAS_SECTION } from './atlasPrompt.js'
 import { OMO_MESSAGE_KIND } from './messageSource.js'
 import * as mem from './memory.js'
+import { memoryResponsibilityText, withMemoryResponsibility } from './memory.js'
 import { MonitorRegistry } from './monitor.js'
 import { createUltraPlan, updateUltraPhase, ultraworkPhaseText, readUltraPlan, recordWaveProgress, type UltraPhase, type Wave } from './ultrawork.js'
 import { buildHandoff } from './handoff.js'
 import { skillRegistrations } from './skills.js'
-import { SISYPHUS_SECTION } from './sisyphusPrompt.js'
+import { sisyphusSectionForMemory } from './sisyphusPrompt.js'
 import { PROMETHEUS_SECTION } from './prometheusPrompt.js'
 import { loadTasks, saveTasks, type TaskRow } from './teamTask.js'
 import { loadLayeredConfig, mergedTools, mergedToggle, loadUserConfig, userRoutesFile, workspaceRoutesFile, readRoutesLayer, writeRoutesLayer, routesLayerExists } from './omoconfig.js'
 import { GoalGuard, countRunningChildren, type GoalsServiceLike, type SubagentRowLike } from './goalGuard.js'
+import { openVikingCall, openVikingUri, parseRemoteMemory, remoteMemoryText, parseListText, resolveListedMemory, uniqueBodyAnchor, compileRemoteMemories, markCompileIncomplete, formatOpenVikingError, OpenVikingAdapterError, OPENVIKING_CAPABILITIES, type OpenVikingRuntime } from './openviking.js'
 
 export const name = PLUGIN_ID
 // 'systemPrompt' is optional at runtime: hosts without dsh-system-prompt still
@@ -86,6 +88,11 @@ export interface Config {
   customPromptSection: string
   /** goal-guard（方案 B）：派发后台子代理期间解除 goal 自动续跑，结算后自动恢复。 */
   goalGuardOn: boolean
+  memoryBackend: 'local' | 'openviking'
+  openvikingProjectId: string
+  openvikingUserScope: boolean
+  openvikingToolPrefix: string
+  openvikingWriteWait: boolean
 }
 
 export const Config = z.object({
@@ -100,6 +107,11 @@ export const Config = z.object({
   customPromptSection: z.string().default(''),
   // goal-guard：默认开启；关闭即退回 harness 原生行为（等待窗口仍会注入 goal 轮次）
   goalGuardOn: z.boolean().default(true),
+  memoryBackend: z.union(['local', 'openviking']).default('local'),
+  openvikingProjectId: z.string().default(''),
+  openvikingUserScope: z.boolean().default(false),
+  openvikingToolPrefix: z.string().default('mcp__openviking__'),
+  openvikingWriteWait: z.boolean().default(false),
 })
 
 type AnyObj = Record<string, unknown>
@@ -122,6 +134,12 @@ interface SysPromptCtx {
 let lastWs = ''
 /** Host ctx (set in apply) — delegate_as reads the subagents service lazily. */
 let hostCtx: unknown = null
+const openVikingOps: Array<{ binding: string; id: string; ts: string; op: string; name: string; beforeHash: string; afterHash: string }> = []
+function openVikingOpsFor(binding: string) { return openVikingOps.filter((entry) => entry.binding === binding) }
+function recordOpenVikingOp(binding: string, op: string, name: string, before: string, after: string): void {
+  openVikingOps.push({ binding, id: `ov-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`, ts: nowTs(), op, name, beforeHash: sha256(before), afterHash: sha256(after) })
+  if (openVikingOps.length > 300) openVikingOps.splice(0, openVikingOps.length - 300)
+}
 
 // ── goal-guard（方案 B）模块级状态 ─────────────────────────────────────
 // 等待窗口内由插件在宿主服务层 disarm goal（模型工具层 pause/resume 需人类回合，
@@ -276,7 +294,7 @@ function tool(
   parameters: AnyObj,
   schema: AnyObj,
   render: (args: AnyObj, value: AnyObj) => unknown[],
-  execute: (args: AnyObj, exec: { signal: AbortSignal; agent?: unknown }) => Promise<AnyObj>,
+  execute: (args: AnyObj, exec: { signal: AbortSignal; agent?: unknown; callId?: string; rootCallId?: string; parent?: unknown; token?: unknown }) => Promise<AnyObj>,
 ): ToolDefinition {
   return defineTool({
     name,
@@ -286,10 +304,10 @@ function tool(
       schema: schema as never,
       render: ((args: unknown, value: unknown) => render(args as AnyObj, value as AnyObj)) as never,
     },
-    async execute(args: AnyObj, exec: { signal: AbortSignal; agent?: unknown }) {
+    async execute(args: AnyObj, exec: { signal: AbortSignal; agent?: unknown; callId?: string; rootCallId?: string; parent?: unknown; token?: unknown }) {
       // Lossless-JSON fence: the harness output validator rejects results that
       // carry explicit-undefined keys; sanitize once here for every omo_* tool.
-      return stripUndefined(await execute(args, { signal: exec.signal, agent: exec.agent }))
+      return stripUndefined(await execute(args, { signal: exec.signal, agent: exec.agent, callId: exec.callId, rootCallId: exec.rootCallId, parent: exec.parent, token: exec.token }))
     },
   } as never)
 }
@@ -328,6 +346,7 @@ export function buildTools(config: Config): ToolDefinition[] {
           plan: { type: 'object', additionalProperties: true },
           monitors: { type: 'integer' },
           goalGuard: { type: 'integer' },
+          memory: { type: 'object', additionalProperties: true },
         },
       },
       (_a, v) =>
@@ -338,7 +357,8 @@ export function buildTools(config: Config): ToolDefinition[] {
             `- rules: ${String((v.rules as AnyObj)?.scanned)} scanned, ${String((v.rules as AnyObj)?.alwaysApply)} alwaysApply\n` +
             `- boulder: ${JSON.stringify(v.counts)}\n` +
             `- monitors: ${String(v.monitors)}\n` +
-            `- goal-guard: ${String(v.goalGuard)} agents guarded`,
+            `- goal-guard: ${String(v.goalGuard)} agents guarded\n` +
+            `- memory: ${JSON.stringify(v.memory)}`,
         ),
       async (_args, exec) => {
         const ws = wsFromExec(config, exec)
@@ -346,6 +366,20 @@ export function buildTools(config: Config): ToolDefinition[] {
         const b = boulderSummary(ws)
         const planWm = loadBoulder(ws).activePlan
         const monitors = new MonitorRegistry(ws).list().length
+        let memoryStatus: AnyObj = { backend: config.memoryBackend }
+        if (config.memoryBackend === 'openviking') {
+          let binding = ''
+          let reachable = false
+          let error = ''
+          try {
+            binding = openVikingUri(config, '')
+            const runtime = (hostCtx as { tools?: OpenVikingRuntime } | null)?.tools
+            if (!runtime?.execute) throw new OpenVikingAdapterError('OpenViking MCP tools unavailable')
+            await openVikingCall(runtime, config, exec, 'list', { uri: binding, recursive: false, offset: 0, limit: 1 })
+            reachable = true
+          } catch (e) { error = formatOpenVikingError(e) }
+          memoryStatus = { backend: 'openviking', binding, capabilities: OPENVIKING_CAPABILITIES, reachable, ...(error ? { reachabilityError: error } : {}), gitBacked: false }
+        } else memoryStatus = { backend: 'local', binding: `${ws}/.omo/memory`, capabilities: 'local memory-core; query omo_memory status for file/git details' }
         return {
           plugin: PLUGIN_ID,
           workspace: ws,
@@ -355,6 +389,7 @@ export function buildTools(config: Config): ToolDefinition[] {
           ...(planWm ? { plan: { planId: planWm.planId, name: planWm.name, total: planWm.total, completed: planWm.completed, status: planWm.status } } : {}),
           monitors,
           goalGuard: goalGuard?.guardedCount() ?? 0,
+          memory: memoryStatus,
         }
       },
     ),
@@ -1000,6 +1035,7 @@ export function buildTools(config: Config): ToolDefinition[] {
           includeBoulder: args.include_boulder !== false,
           includePlan: args.include_plan !== false,
           includeRules: args.include_rules !== false,
+          memoryBackend: config.memoryBackend,
         })
         return { markdown: md, length: md.length }
       },
@@ -1195,16 +1231,18 @@ export function buildTools(config: Config): ToolDefinition[] {
   tools.push(
     tool(
       'omo_memory',
-      '持久记忆引擎（复刻 oh-my-openagent memory-core）：git 后端(尽力而为) + markdown MemFS + frontmatter 契约（description 必填 / read_only 禁改）+ 事务日志 + compile 注入块。actions: status/list/create/put/read/str_replace/insert/delete/rename/update_description/compile/search/reflect/extract/journal。',
+      config.memoryBackend === 'openviking'
+         ? `OpenViking 记忆适配：经宿主 ToolRuntime 调官方 mcp__openviking__*，仅在明确 binding scope 做精确 CRUD；frontmatter description/read_only 由适配层强制。支持 status/list/create/put/read/str_replace/insert/delete/update_description/search/compile/journal；rename/reflect/extract 不支持。insert 要求全文唯一且位于正文的锚点；journal 是按 binding 分区的 adapter-local 日志，不是服务端事务或 Git。`
+         : '持久记忆引擎（复刻 oh-my-openagent memory-core）：git 后端(尽力而为) + markdown MemFS + frontmatter 契约（description 必填 / read_only 禁改）+ 事务日志 + compile 注入块。actions: status/list/create/put/read/str_replace/insert/delete/rename/update_description/compile/search/reflect/extract/journal。',
       {
         action: { type: 'string', enum: ['status', 'list', 'create', 'put', 'read', 'str_replace', 'insert', 'delete', 'rename', 'update_description', 'compile', 'search', 'reflect', 'extract', 'journal'], required: true },
         name: { type: 'string', description: '记忆名（A-Za-z0-9._-，≤60）' },
         content: { type: 'string', description: '记忆正文（create/put/insert）' },
         description: { type: 'string', description: '记忆描述（create/put/update_description 必填非空）' },
-        old_text: { type: 'string', description: 'str_replace 的旧文本' },
+        old_text: { type: 'string', description: 'str_replace 的旧文本；OpenViking insert 用作唯一插入锚点' },
         new_text: { type: 'string', description: 'str_replace 的新文本' },
         new_name: { type: 'string', description: 'rename 新名' },
-        after_line: { type: 'integer', description: 'insert 插入行（1 基，默认文末）' },
+        after_line: { type: 'integer', description: '本地 insert 插入行（1 基，默认文末）；OpenViking 不使用' },
         read_only: { type: 'boolean', description: 'create 时标记只读' },
         query: { type: 'string', description: 'search 查询' },
         text: { type: 'string', description: 'extract 的文本源' },
@@ -1221,27 +1259,33 @@ export function buildTools(config: Config): ToolDefinition[] {
           memory: { type: 'object', additionalProperties: true },
           block: { type: 'string' }, hash: { type: 'string' }, cached: { type: 'boolean' },
           hits: { type: 'array', items: { type: 'object', additionalProperties: true } },
+          resultText: { type: 'string' },
+          incomplete: { type: 'boolean' },
+          query: { type: 'string' },
           added: { type: 'array', items: { type: 'string' } },
           journal: { type: 'array', items: { type: 'object', additionalProperties: true } },
         },
       },
       (_a, v) => {
         const action = String(v.action)
+        if (v.ok === false) return text(`memory ${action}: ${String(v.message || 'failed')}`)
         const wrap = (s2: string): string[] => [`memory ${action}: ${s2}`]
         if (action === 'status') {
           const st = (v.status as AnyObj) ?? {}
+          if (st.backend === 'openviking') return text(`memory status: backend=openviking reachable=${String(st.reachable)} gitBacked=false binding=${String(st.binding)} adapterLocalOps=${String(st.adapterLocalOps)} capabilities=${JSON.stringify(st.capabilities)}${st.reachabilityError ? `\\nreachabilityError=${String(st.reachabilityError)}` : ''}`)
           const l = [`memory status: dir=${String(st.dir)} files=${String(st.files)} readOnly=${String(st.readOnly)} git=${String(st.gitBacked)} ops=${String(st.ops)} compiled=${String(st.compiledHash).slice(0, 8)}`]
           l.push(((v.files as Array<AnyObj>) ?? []).map((f) => `  - ${f.name} — ${f.description}${f.readOnly ? ' [ro]' : ''}`).join('\n') || '  (empty)')
           return text(l.join('\n'))
         }
         if (action === 'compile') return text(`记忆编译 ${String(v.cached) ? '(缓存)' : '(新)'} hash=${String(v.hash).slice(0, 12)}\n\n${String(v.block).slice(0, 2000)}`)
         if (action === 'search') {
+          if (typeof v.resultText === 'string') return text(`OpenViking find result:\n${v.resultText}`)
           const hits = (v.hits as Array<AnyObj>) ?? []
           return text(`memory search「${String(v.query)}」→ ${hits.length} 条\n` + hits.map((h) => `  - ${h.name} (score ${h.score}): ${h.snippet}`).join('\n') || '(none)')
         }
         if (action === 'list') {
           const files = (v.files as Array<AnyObj>) ?? []
-          return text(`记忆文件 ${files.length} 个:\n` + files.map((f) => `  - ${f.name} — ${f.description}${f.readOnly ? ' [ro]' : ''}`).join('\n') || '(empty)')
+          return text(`记忆文件 ${files.length} 个:\n` + files.map((f) => `  - ${f.name} — ${f.description == null ? '元数据未知（read 后可见）' : f.description}${f.readOnly === true ? ' [ro]' : f.readOnly === null ? ' [read_only 未知]' : ''}`).join('\n') || '(empty)')
         }
         if (action === 'read') {
           const m = (v.memory as AnyObj) ?? {}
@@ -1252,11 +1296,142 @@ export function buildTools(config: Config): ToolDefinition[] {
       async (args, exec) => {
         const ws = wsFromExec(config, exec)
         const action = String(args.action || 'status')
+        const name = String(args.name || '')
+        const content = String(args.content ?? '')
+        const description = String(args.description ?? '')
+        const say = (message: string, extra: AnyObj = {}): AnyObj => ({ ok: true, action, message, ...extra })
         try {
-          const name = String(args.name || '')
-          const content = String(args.content ?? '')
-          const description = String(args.description ?? '')
-          const say = (message: string, extra: AnyObj = {}): AnyObj => ({ ok: true, action, message, ...extra })
+          if (config.memoryBackend === 'openviking') {
+            let binding = ''
+            try { binding = openVikingUri(config, '') } catch (e) {
+              return { ok: false, action, message: `OpenViking binding unavailable: ${formatOpenVikingError(e, 'list')}` }
+            }
+            const runtime = (hostCtx as { tools?: OpenVikingRuntime } | null)?.tools
+            const call = (op: string, a: AnyObj) => {
+              if (!runtime?.execute) throw new OpenVikingAdapterError('OpenViking MCP tools unavailable: host tools.execute is missing')
+              return openVikingCall(runtime, config, exec, op, a)
+            }
+            const requestedName = String(args.name || '')
+            const remoteName = requestedName.replace(/\.md$/, '')
+            if (['read', 'create', 'put', 'delete', 'str_replace', 'insert', 'update_description'].includes(action) && !remoteName) return { ok: false, action, message: 'memory name is empty after normalization' }
+            const uri = openVikingUri(config, requestedName)
+            if (action === 'rename') return { ok: false, action, message: 'unsupported: OpenViking has no rename/move tool; no copy-delete fallback is allowed' }
+            if (action === 'reflect' || action === 'extract') return { ok: false, action, message: `unsupported in OpenViking adapter: ${action}` }
+            if (action === 'update_description') {
+              const m = parseRemoteMemory(remoteName, await call('read', { uris: [uri] }))
+              if (m.readOnly) throw new OpenVikingAdapterError(`memory file "${remoteName}" is read_only — mutation blocked`)
+              if (!description.trim()) throw new OpenVikingAdapterError('description must be non-empty')
+              const before = remoteMemoryText(m.description || 'missing description', m.readOnly, m.body)
+              const after = remoteMemoryText(description, m.readOnly, m.body)
+              const result = await call('write', { uri, content: after, mode: 'replace', wait: config.openvikingWriteWait })
+              recordOpenVikingOp(binding, action, remoteName, before, after)
+              return say(result, { memory: { ...m, description } })
+            }
+            if (action === 'status') {
+              let reachable = false
+              let reachabilityError = ''
+              try { await call('list', { uri: binding, recursive: false, offset: 0, limit: 1 }); reachable = true } catch (e) { reachabilityError = formatOpenVikingError(e, 'list') }
+              return say('', { status: { backend: 'openviking', binding, capabilities: OPENVIKING_CAPABILITIES, reachable, ...(reachabilityError ? { reachabilityError } : {}), gitBacked: false, adapterLocalOps: openVikingOpsFor(binding).length }, files: [] })
+            }
+            if (action === 'journal') {
+              const requestedTail = Number(args.tail ?? 15)
+              const tail = Number.isFinite(requestedTail) ? Math.max(1, Math.min(300, Math.trunc(requestedTail))) : 15
+              const entries = openVikingOpsFor(binding)
+              return say(`adapter-local operation log (${entries.length} entries for this binding; not server transaction/Git)`, { journal: entries.slice(-tail).reverse() })
+            }
+            if (action === 'read') {
+              const raw = await call('read', { uris: [uri] })
+              const m = parseRemoteMemory(remoteName, raw)
+              return say('', { memory: m })
+            }
+            if (action === 'create' || action === 'put') {
+              if (!remoteName || args.content === undefined) return { ok: false, action, message: `${action} requires a non-empty root-level name and content` }
+              if (action === 'create' && !description.trim()) return { ok: false, action, message: 'create requires non-empty description' }
+              let desc = description
+              let readOnly = Boolean(args.read_only)
+              let writeMode: 'create' | 'replace' = action === 'create' ? 'create' : 'replace'
+              if (action === 'put') {
+                // `list` decides existence; a listed entry must be readable before replace.
+                // Read/ACL/tool/config failures never become a create fallback.
+                const listed = parseListText(await call('list', { uri: binding, recursive: true, offset: 0, limit: 500 }))
+                  .map((item) => resolveListedMemory(binding, item))
+                const existing = listed.find((item) => item.name === remoteName)
+                if (existing) {
+                  const old = parseRemoteMemory(remoteName, await call('read', { uris: [existing.uri] }))
+                  desc = description || old.description
+                  readOnly = old.readOnly
+                  if (old.readOnly) throw new OpenVikingAdapterError(`memory file "${remoteName}" is read_only — mutation blocked`)
+                  writeMode = 'replace'
+                } else {
+                  if (!desc.trim()) throw new OpenVikingAdapterError('put of a missing remote memory requires description')
+                  writeMode = 'create'
+                }
+              }
+              const written = remoteMemoryText(desc, readOnly, content)
+              const result = await call('write', { uri, content: written, mode: writeMode, wait: config.openvikingWriteWait })
+              recordOpenVikingOp(binding, action, remoteName, '', written)
+              return say(result, { memory: { name: remoteName, description: desc, body: content, readOnly } })
+            }
+            if (action === 'delete') {
+              const m = parseRemoteMemory(remoteName, await call('read', { uris: [uri] }))
+              if (m.readOnly) throw new OpenVikingAdapterError(`memory file "${remoteName}" is read_only — mutation blocked`)
+              const result = await call('forget', { uri, recursive: false })
+              recordOpenVikingOp(binding, action, remoteName, m.body, '')
+              return say(result)
+            }
+            if (action === 'str_replace') {
+              const raw = await call('read', { uris: [uri] })
+              const m = parseRemoteMemory(remoteName, raw)
+              if (m.readOnly) throw new OpenVikingAdapterError(`memory file "${remoteName}" is read_only — mutation blocked`)
+              const old = String(args.old_text ?? '')
+              const at = uniqueBodyAnchor(raw, old)
+              const replacement = String(args.new_text ?? '')
+              const replaced = m.body.slice(0, at) + replacement + m.body.slice(at + old.length)
+              const result = await call('edit', { uri, old_string: old, new_string: replacement, replace_all: false, wait: config.openvikingWriteWait })
+              recordOpenVikingOp(binding, action, remoteName, m.body, replaced)
+              return say(result, { memory: { ...m, body: replaced } })
+            }
+            if (action === 'insert') {
+              const raw = await call('read', { uris: [uri] })
+              const m = parseRemoteMemory(remoteName, raw)
+              if (m.readOnly) throw new OpenVikingAdapterError(`memory file "${remoteName}" is read_only — mutation blocked`)
+              const anchor = String(args.old_text ?? '')
+              const at = uniqueBodyAnchor(raw, anchor)
+              const addition = String(args.content ?? '')
+              if (!addition) throw new OpenVikingAdapterError('insert requires content')
+              const insertion = addition.endsWith('\n') ? addition : `${addition}\n`
+              const inserted = m.body.slice(0, at) + insertion + m.body.slice(at)
+              const result = await call('edit', { uri, old_string: anchor, new_string: insertion + anchor, replace_all: false, wait: config.openvikingWriteWait })
+              recordOpenVikingOp(binding, action, remoteName, m.body, inserted)
+              return say(result, { memory: { ...m, body: inserted } })
+            }
+            if (action === 'list') {
+              const raw = await call('list', { uri: binding, recursive: true, offset: 0, limit: 500, sort_by: 'name', sort_order: 'asc' })
+              const files = parseListText(raw).map((line) => {
+                const entry = resolveListedMemory(binding, line)
+                return { name: entry.name, uri: entry.uri, description: null, readOnly: null }
+              })
+              return say(`${files.length} remote memories; description/read_only metadata is unknown until read`, { files })
+            }
+            if (action === 'search') return say('OpenViking find result', { query: String(args.query || ''), resultText: await call('find', { query: String(args.query || ''), target_uri: binding }) })
+            if (action === 'compile') {
+              const raw = await call('list', { uri: binding, recursive: true, offset: 0, limit: 500 })
+              const listed = parseListText(raw)
+              const max = Math.max(0, Number(args.max_chars ?? 12000))
+              const entries: Array<{ name: string; description: string; readOnly: boolean; body: string }> = []
+              let compiled = compileRemoteMemories(entries, max)
+              for (const item of listed) {
+                const resolved = resolveListedMemory(binding, item)
+                const m = parseRemoteMemory(resolved.name, await call('read', { uris: [resolved.uri] }))
+                entries.push(m)
+                compiled = compileRemoteMemories(entries, max)
+                if (compiled.incomplete) break
+              }
+              if (compiled.files.length < listed.length || listed.length === 500) compiled = markCompileIncomplete(compiled, max)
+              return say(compiled.incomplete ? 'compiled (incomplete)' : 'compiled', { block: compiled.block, hash: sha256(compiled.block), cached: false, files: compiled.files, incomplete: compiled.incomplete })
+            }
+            return { ok: false, action, message: `unsupported in OpenViking adapter: ${action}` }
+          }
           switch (action) {
             case 'status': {
               const st = mem.memoryStatus(ws)
@@ -1327,7 +1502,7 @@ export function buildTools(config: Config): ToolDefinition[] {
               return { ok: false, action, message: 'unknown action' }
           }
         } catch (e) {
-          return { ok: false, action, message: String((e as Error)?.message ?? e) }
+          return { ok: false, action, message: config.memoryBackend === 'openviking' ? formatOpenVikingError(e, action) : String((e as Error)?.message ?? e) }
         }
       },
     ),
@@ -1912,10 +2087,20 @@ function apiStatus(config: Config): AnyObj {
   const rules = scanRules(ws)
   const b = boulderSummary(ws)
   const reg = new MonitorRegistry(ws)
+  let memory: AnyObj = { backend: config.memoryBackend }
+  if (config.memoryBackend === 'openviking') {
+    let binding = ''
+    let error = ''
+    try { binding = openVikingUri(config, '') } catch (e) { error = formatOpenVikingError(e) }
+    const runtime = (hostCtx as { tools?: OpenVikingRuntime } | null)?.tools
+    if (!runtime?.execute) error ||= 'OpenViking MCP tools unavailable; reachability unprobed'
+    memory = { backend: 'openviking', binding, capabilities: OPENVIKING_CAPABILITIES, reachable: 'unprobed (use omo_memory status for live probe)', ...(error ? { reachabilityError: error } : {}), gitBacked: false }
+  } else memory = { backend: 'local', binding: `${ws}/.omo/memory`, capabilities: 'local memory-core; query omo_memory status for file/git details' }
   return {
     plugin: PLUGIN_ID,
     workspace: ws,
     tools: statusToolNames(config),
+    memory,
     ts: nowTs(),
     rules: {
       total: rules.length,
@@ -2156,7 +2341,7 @@ export function apply(ctx: Context, config: Config): void {
   }
 
   // skills
-  for (const reg of skillRegistrations()) {
+  for (const reg of skillRegistrations(config.memoryBackend)) {
     regOnce(ctx, () => ((ctx as unknown as SkillsCtx).skills).register(reg), `dsh-oh-my-agent skill: ${reg.name}`)
   }
 
@@ -2706,8 +2891,9 @@ export function apply(ctx: Context, config: Config): void {
       ctx.logger?.warn?.(`[dsh-oh-my-agent] mainPrompt=${config.mainPrompt} requested but host has no systemPrompt service - skipped`)
     }
   } else {
-    const body = config.mainPrompt === 'sisyphus' ? SISYPHUS_SECTION
+    const base = config.mainPrompt === 'sisyphus' ? sisyphusSectionForMemory(config.memoryBackend)
       : config.mainPrompt === 'custom' ? config.customPromptSection : ''
+    const body = withMemoryResponsibility(base, config.memoryBackend)
     if (body.trim()) {
       try {
         // B 方案：orchestration 纪律段按会话模式唯一化——off 才注入 Sisyphus；
@@ -2734,7 +2920,7 @@ export function apply(ctx: Context, config: Config): void {
       regOnce(ctx, () => spCtx.systemPrompt!.section({
         name: 'omo:prometheus-planning',
         order: 50,
-        text: (context) => (context?.agent !== undefined && sessionModeOf(context.agent) === 'prometheus') ? PROMETHEUS_SECTION : '',
+        text: (context) => (context?.agent !== undefined && sessionModeOf(context.agent) === 'prometheus') ? `${PROMETHEUS_SECTION}\n\n## Persistent memory ownership\n${memoryResponsibilityText(config.memoryBackend)}` : '',
       }), 'dsh-oh-my-agent: prometheus-planning section')
       ctx.logger?.info?.('[dsh-oh-my-agent] prometheus-planning section registered (name=omo:prometheus-planning, order=50, dynamic)')
     } catch (e) {
@@ -2749,7 +2935,7 @@ export function apply(ctx: Context, config: Config): void {
       regOnce(ctx, () => spCtx.systemPrompt!.section({
         name: 'omo:atlas-execution',
         order: 50,
-        text: (context) => (context?.agent !== undefined && sessionModeOf(context.agent) === 'atlas') ? ATLAS_SECTION : '',
+        text: (context) => (context?.agent !== undefined && sessionModeOf(context.agent) === 'atlas') ? `${ATLAS_SECTION}\n\n## Persistent memory ownership\n${memoryResponsibilityText(config.memoryBackend)}` : '',
       }), 'dsh-oh-my-agent: atlas-execution section')
       ctx.logger?.info?.('[dsh-oh-my-agent] atlas-execution section registered (name=omo:atlas-execution, order=50, dynamic)')
     } catch (e) {
