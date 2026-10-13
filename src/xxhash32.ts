@@ -23,47 +23,41 @@ const P5 = 374761393
 export function xxhash32(input: string): number {
   const bytes = Buffer.from(input, 'utf8')
   const n = bytes.length
+  let h: number
+  let i = 0
+
   if (n >= 16) {
     let v1 = (P1 + P2) >>> 0
     let v2 = P2 >>> 0
     let v3 = 0
     let v4 = (0 - P1) >>> 0
-    let i = 0
     while (i + 16 <= n) {
-      v1 = rotl((v1 + (bytes.readUInt32LE(i) * P2) >>> 0), 13) * P1 >>> 0
-      v2 = rotl((v2 + (bytes.readUInt32LE(i + 4) * P2) >>> 0), 13) * P1 >>> 0
-      v3 = rotl((v3 + (bytes.readUInt32LE(i + 8) * P2) >>> 0), 13) * P1 >>> 0
-      v4 = rotl((v4 + (bytes.readUInt32LE(i + 12) * P2) >>> 0), 13) * P1 >>> 0
+      v1 = Math.imul(rotl((v1 + Math.imul(bytes.readUInt32LE(i), P2)) >>> 0, 13), P1) >>> 0
+      v2 = Math.imul(rotl((v2 + Math.imul(bytes.readUInt32LE(i + 4), P2)) >>> 0, 13), P1) >>> 0
+      v3 = Math.imul(rotl((v3 + Math.imul(bytes.readUInt32LE(i + 8), P2)) >>> 0, 13), P1) >>> 0
+      v4 = Math.imul(rotl((v4 + Math.imul(bytes.readUInt32LE(i + 12), P2)) >>> 0, 13), P1) >>> 0
       i += 16
     }
-    let h = (rotl(v1, 1) + rotl(v2, 7) + rotl(v3, 12) + rotl(v4, 18)) >>> 0
-    for (let j = 0; j < 16; j++) {
-      h = (h * P2 + bytes.readUInt32LE(i + j * 4) * P2) >>> 0
-      h = rotl(h, 11) * P1 >>> 0
-    }
-    h ^= h >>> 15
-    h = (h * P3) >>> 0
-    h ^= h >>> 13
-    h = (h * P4) >>> 0
-    h ^= h >>> 16
-    return h >>> 0
+    h = (rotl(v1, 1) + rotl(v2, 7) + rotl(v3, 12) + rotl(v4, 18) + n) >>> 0
+  } else {
+    h = (P5 + n) >>> 0
   }
-  let h = (P5 + n) >>> 0
-  let i = 0
+
   while (i + 4 <= n) {
-    h = (h + bytes.readUInt32LE(i) * P3) >>> 0
-    h = rotl(h, 17) * P4 >>> 0
+    h = (h + Math.imul(bytes.readUInt32LE(i), P3)) >>> 0
+    h = Math.imul(rotl(h, 17), P4) >>> 0
     i += 4
   }
   while (i < n) {
-    h = (h + bytes[i] * P5) >>> 0
-    h = rotl(h, 11) * P1 >>> 0
+    h = (h + Math.imul(bytes[i]!, P5)) >>> 0
+    h = Math.imul(rotl(h, 11), P1) >>> 0
     i += 1
   }
+
   h ^= h >>> 15
-  h = (h * P3) >>> 0
+  h = Math.imul(h, P2) >>> 0
   h ^= h >>> 13
-  h = (h * P4) >>> 0
+  h = Math.imul(h, P3) >>> 0
   h ^= h >>> 16
   return h >>> 0
 }
